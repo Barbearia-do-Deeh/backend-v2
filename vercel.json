@@ -1,0 +1,16 @@
+# Barbearia do Deeh — Backend
+
+## Variáveis de ambiente (configurar no Vercel em Settings > Environment Variables)
+
+```
+GOOGLE_CLIENT_EMAIL=barbearia-agenda@barbearia-do-deeh.iam.gserviceaccount.com
+GOOGLE_PRIVATE_KEY=-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n
+CALENDAR_ID=davidlucas261210@gmail.com
+```
+
+⚠️ Ao colar a GOOGLE_PRIVATE_KEY no campo da Vercel, mantenha os "\n" literais (não quebre linhas de verdade) — o código faz o replace(/\\n/g, '\n') para converter.
+
+## Checklist antes de testar
+1. Settings > Deployment Protection: deixar DESATIVADO (ou "Only Preview Deployments")
+2. Settings > Environment Variables: as 3 variáveis acima cadastradas
+3. Testar endpoint com POST em /api/agendar
