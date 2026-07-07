@@ -1,15 +1,20 @@
 // api/disponibilidade.js
 // Endpoint: GET/POST /api/disponibilidade?data=dd/mm/aaaa
 // Retorna os períodos já ocupados no Google Calendar para o dia informado.
-//
-// IMPORTANTE: confirme os nomes das env vars abaixo contra as que já
-// existem no agendar.js (GOOGLE_CLIENT_EMAIL, GOOGLE_PRIVATE_KEY,
-// GOOGLE_CALENDAR_ID) — usei os nomes mais prováveis com base no que
-// já está configurado no projeto.
+// Env vars e padrão de auth iguais aos do agendar.js (JWT + CALENDAR_ID).
 
 const { google } = require('googleapis');
 
+const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
+const CALENDAR_ID = process.env.CALENDAR_ID || 'davidlucas261210@gmail.com';
+
 module.exports = async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'GET' && req.method !== 'POST') {
     return res.status(405).json({ error: 'Método não permitido' });
   }
@@ -21,18 +26,15 @@ module.exports = async (req, res) => {
     }
 
     const [dia, mes, ano] = data.split('/');
-    const dataISO = `${ano}-${mes}-${dia}`;
+    const dataISO = `${ano}-${mes.padStart(2, '0')}-${dia.padStart(2, '0')}`;
 
-    const auth = new google.auth.GoogleAuth({
-      credentials: {
-        client_email: process.env.GOOGLE_CLIENT_EMAIL,
-        private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-      },
+    const auth = new google.auth.JWT({
+      email: CLIENT_EMAIL,
+      key: PRIVATE_KEY,
       scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
     });
 
     const calendar = google.calendar({ version: 'v3', auth });
-    const calendarId = process.env.GOOGLE_CALENDAR_ID || 'davidlucas261210@gmail.com';
 
     const timeMin = `${dataISO}T00:00:00-03:00`;
     const timeMax = `${dataISO}T23:59:59-03:00`;
@@ -42,11 +44,11 @@ module.exports = async (req, res) => {
         timeMin,
         timeMax,
         timeZone: 'America/Sao_Paulo',
-        items: [{ id: calendarId }],
+        items: [{ id: CALENDAR_ID }],
       },
     });
 
-    const busy = response.data.calendars[calendarId].busy || [];
+    const busy = response.data.calendars[CALENDAR_ID].busy || [];
 
     const ocupados = busy.map((periodo) => ({
       inicio: new Date(periodo.start).toLocaleTimeString('pt-BR', {
