@@ -2,6 +2,9 @@
   "functions": {
     "api/agendar.js": {
       "maxDuration": 10
+    },
+    "api/disponibilidade.js": {
+      "maxDuration": 10
     }
   }
 }
