@@ -5,6 +5,12 @@
     },
     "api/disponibilidade.js": {
       "maxDuration": 10
+    },
+    "api/clientes.js": {
+      "maxDuration": 10
+    },
+    "api/atendimentos.js": {
+      "maxDuration": 10
     }
   }
 }
