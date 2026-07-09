@@ -11,6 +11,9 @@
     },
     "api/atendimentos.js": {
       "maxDuration": 10
+    },
+    "api/agenda-hoje.js": {
+      "maxDuration": 10
     }
   }
 }
