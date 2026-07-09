@@ -1,0 +1,10 @@
+{
+  "name": "barbearia-deeh-backend",
+  "version": "1.0.0",
+  "description": "Backend de agendamento - Barbearia do Deeh",
+  "main": "api/agendar.js",
+  "dependencies": {
+    "googleapis": "^131.0.0",
+    "pg": "^8.11.3"
+  }
+}
