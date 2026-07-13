@@ -5,6 +5,7 @@
   "main": "api/agendar.js",
   "dependencies": {
     "googleapis": "^131.0.0",
-    "pg": "^8.11.3"
+    "pg": "^8.11.3",
+    "web-push": "^3.6.7"
   }
 }
