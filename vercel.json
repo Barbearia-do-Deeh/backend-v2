@@ -14,6 +14,12 @@
     },
     "api/agenda-hoje.js": {
       "maxDuration": 10
+    },
+    "api/push-subscribe.js": {
+      "maxDuration": 10
+    },
+    "api/enviar-lembretes.js": {
+      "maxDuration": 30
     }
   }
 }
