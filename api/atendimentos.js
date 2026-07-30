@@ -17,6 +17,19 @@ module.exports = async (req, res) => {
   const client = await pool.connect();
   try {
     if (req.method === 'GET') {
+      const { telefone } = req.query;
+
+      if (telefone) {
+        const result = await client.query(
+          `SELECT a.*, c.nome, c.telefone FROM atendimentos a
+           JOIN clientes c ON c.id = a.cliente_id
+           WHERE c.telefone = $1
+           ORDER BY a.data_hora DESC LIMIT 50`,
+          [telefone]
+        );
+        return res.status(200).json({ success: true, atendimentos: result.rows });
+      }
+
       const result = await client.query(
         `SELECT a.*, c.nome, c.telefone FROM atendimentos a
          JOIN clientes c ON c.id = a.cliente_id
