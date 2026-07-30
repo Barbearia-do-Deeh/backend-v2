@@ -115,6 +115,59 @@ module.exports = async (req, res) => {
       return res.status(200).json({ success: true, cliente });
     }
 
+    if (req.method === 'PUT') {
+      const { id, nome, telefone, plano, subtipo_essencial,
+        cortes_restantes, barbas_restantes, pezinhos_restantes, sobrancelha_restante } = req.body;
+
+      if (!id) {
+        return res.status(400).json({ error: 'id é obrigatório' });
+      }
+
+      await client.query('BEGIN');
+
+      const clienteFields = [];
+      const clienteValues = [];
+      let i = 1;
+      if (nome !== undefined) { clienteFields.push(`nome = $${i++}`); clienteValues.push(nome); }
+      if (telefone !== undefined) { clienteFields.push(`telefone = $${i++}`); clienteValues.push(telefone); }
+      if (plano !== undefined) { clienteFields.push(`plano = $${i++}`); clienteValues.push(plano); }
+      if (subtipo_essencial !== undefined) { clienteFields.push(`subtipo_essencial = $${i++}`); clienteValues.push(subtipo_essencial); }
+
+      if (clienteFields.length > 0) {
+        clienteValues.push(id);
+        await client.query(
+          `UPDATE clientes SET ${clienteFields.join(', ')} WHERE id = $${i}`,
+          clienteValues
+        );
+      }
+
+      const saldoFields = [];
+      const saldoValues = [];
+      let j = 1;
+      if (cortes_restantes !== undefined) { saldoFields.push(`cortes_restantes = $${j++}`); saldoValues.push(cortes_restantes); }
+      if (barbas_restantes !== undefined) { saldoFields.push(`barbas_restantes = $${j++}`); saldoValues.push(barbas_restantes); }
+      if (pezinhos_restantes !== undefined) { saldoFields.push(`pezinhos_restantes = $${j++}`); saldoValues.push(pezinhos_restantes); }
+      if (sobrancelha_restante !== undefined) { saldoFields.push(`sobrancelha_restante = $${j++}`); saldoValues.push(sobrancelha_restante); }
+
+      if (saldoFields.length > 0) {
+        saldoValues.push(id);
+        await client.query(
+          `UPDATE saldo_ciclo SET ${saldoFields.join(', ')} WHERE cliente_id = $${j}`,
+          saldoValues
+        );
+      }
+
+      await client.query('COMMIT');
+
+      const atualizado = await client.query(
+        `SELECT c.*, s.cortes_restantes, s.barbas_restantes, s.pezinhos_restantes, s.sobrancelha_restante
+         FROM clientes c LEFT JOIN saldo_ciclo s ON s.cliente_id = c.id WHERE c.id = $1`,
+        [id]
+      );
+
+      return res.status(200).json({ success: true, cliente: atualizado.rows[0] });
+    }
+
     return res.status(405).json({ error: 'Método não permitido' });
   } catch (err) {
     console.error('Erro em /api/clientes:', err.message);
