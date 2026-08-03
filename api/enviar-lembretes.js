@@ -168,6 +168,100 @@ async function enviarLembretesPacote(req, res) {
   });
 }
 
+async function temAgendamentoFuturo(calendar, telefone) {
+  const agora = new Date();
+  const daqui30dias = new Date(agora.getTime() + 30 * 24 * 60 * 60 * 1000);
+
+  const response = await calendar.events.list({
+    calendarId: CALENDAR_ID,
+    timeMin: agora.toISOString(),
+    timeMax: daqui30dias.toISOString(),
+    singleEvents: true,
+    orderBy: 'startTime',
+  });
+
+  const eventos = response.data.items || [];
+  return eventos.some((ev) => {
+    const { telefone: telEvento } = parseDescricao(ev.description);
+    return telEvento === telefone;
+  });
+}
+
+async function enviarLembretesInatividade(req, res) {
+  const auth = new google.auth.JWT({
+    email: CLIENT_EMAIL,
+    key: PRIVATE_KEY,
+    scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
+  });
+  const calendar = google.calendar({ version: 'v3', auth });
+
+  const clientesResult = await pool.query(
+    `SELECT c.id, c.nome, c.telefone
+     FROM clientes c
+     LEFT JOIN (
+       SELECT cliente_id, MAX(data_hora) AS ultimo_atendimento
+       FROM atendimentos
+       GROUP BY cliente_id
+     ) a ON a.cliente_id = c.id
+     WHERE COALESCE(a.ultimo_atendimento, c.created_at) <= NOW() - INTERVAL '20 days'`
+  );
+
+  let enviados = 0;
+  let pulados = 0;
+  const erros = [];
+
+  for (const cliente of clientesResult.rows) {
+    if (!cliente.telefone) { pulados++; continue; }
+
+    const ultimoEnvio = await pool.query(
+      'SELECT enviado_em FROM lembretes_inatividade_enviados WHERE cliente_id = $1',
+      [cliente.id]
+    );
+    if (ultimoEnvio.rows.length > 0) {
+      const diasDesdeUltimoEnvio =
+        (Date.now() - new Date(ultimoEnvio.rows[0].enviado_em).getTime()) / (1000 * 60 * 60 * 24);
+      if (diasDesdeUltimoEnvio < 7) { pulados++; continue; }
+    }
+
+    const jaTemAgendamento = await temAgendamentoFuturo(calendar, cliente.telefone);
+    if (jaTemAgendamento) { pulados++; continue; }
+
+    const subRow = await pool.query(
+      'SELECT subscription FROM push_subscriptions WHERE telefone = $1',
+      [cliente.telefone]
+    );
+    if (subRow.rows.length === 0) { pulados++; continue; }
+
+    const payload = JSON.stringify({
+      title: 'Barbearia do Deeh',
+      body: `Iae ${cliente.nome}, e esse cabelo desse tamanho todo? Já tá na hora de reagendar!`,
+      icon: '/icon-192.png',
+    });
+
+    try {
+      await webpush.sendNotification(subRow.rows[0].subscription, payload);
+      await pool.query(
+        `INSERT INTO lembretes_inatividade_enviados (cliente_id, enviado_em)
+         VALUES ($1, CURRENT_DATE)
+         ON CONFLICT (cliente_id) DO UPDATE SET enviado_em = CURRENT_DATE`,
+        [cliente.id]
+      );
+      enviados++;
+    } catch (pushErr) {
+      erros.push({ telefone: cliente.telefone, erro: pushErr.message });
+    }
+  }
+
+  return res.status(200).json({
+    success: true,
+    tipo: 'inatividade',
+    verificados: clientesResult.rows.length,
+    enviados,
+    pulados,
+    erros,
+  });
+}
+
 module.exports = async (req, res) => {
   if (!CRON_SECRET || req.query.secret !== CRON_SECRET) {
     return res.status(401).json({ success: false, error: 'Não autorizado' });
@@ -176,6 +270,9 @@ module.exports = async (req, res) => {
   try {
     if (req.query.tipo === 'pacote') {
       return await enviarLembretesPacote(req, res);
+    }
+    if (req.query.tipo === 'inatividade') {
+      return await enviarLembretesInatividade(req, res);
     }
     return await enviarLembretesAgendamento(req, res);
   } catch (err) {
