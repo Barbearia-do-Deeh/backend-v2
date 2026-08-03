@@ -1,10 +1,65 @@
+const { google } = require('googleapis');
 const pool = require('../lib/db');
 const { PRECOS, saldoInicial, campoSaldo } = require('../lib/pacotes');
+
+const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
+const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
+const CALENDAR_ID = process.env.CALENDAR_ID || 'davidlucas261210@gmail.com';
 
 function addDias(data, dias) {
   const d = new Date(data);
   d.setDate(d.getDate() + dias);
   return d.toISOString().slice(0, 10);
+}
+
+function parseDescricao(desc) {
+  const result = { telefone: null };
+  if (!desc) return result;
+  const tel = desc.match(/WhatsApp:\s*(.+)/);
+  if (tel) result.telefone = tel[1].trim().replace(/\D/g, '');
+  return result;
+}
+
+function parseNomeServico(summary) {
+  const partes = (summary || '').split(' — ');
+  const servico = partes.length > 0 ? partes[0].replace(/^[^\p{L}]+/u, '').trim() : (summary || '');
+  return { servico };
+}
+
+async function buscarProximoAgendamento(telefone) {
+  const auth = new google.auth.JWT({
+    email: CLIENT_EMAIL,
+    key: PRIVATE_KEY,
+    scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
+  });
+  const calendar = google.calendar({ version: 'v3', auth });
+
+  const agora = new Date();
+  const daqui90dias = new Date(agora.getTime() + 90 * 24 * 60 * 60 * 1000);
+
+  const response = await calendar.events.list({
+    calendarId: CALENDAR_ID,
+    timeMin: agora.toISOString(),
+    timeMax: daqui90dias.toISOString(),
+    singleEvents: true,
+    orderBy: 'startTime',
+  });
+
+  const eventos = response.data.items || [];
+  const telefoneLimpo = (telefone || '').replace(/\D/g, '');
+
+  const evento = eventos.find((ev) => {
+    const { telefone: telEvento } = parseDescricao(ev.description);
+    return telEvento === telefoneLimpo && ev.start?.dateTime;
+  });
+
+  if (!evento) return null;
+
+  const { servico } = parseNomeServico(evento.summary);
+  return {
+    servico,
+    data_hora: evento.start.dateTime,
+  };
 }
 
 module.exports = async (req, res) => {
@@ -27,7 +82,19 @@ module.exports = async (req, res) => {
            ORDER BY a.data_hora DESC LIMIT 50`,
           [telefone]
         );
-        return res.status(200).json({ success: true, atendimentos: result.rows });
+
+        let proximoAgendamento = null;
+        try {
+          proximoAgendamento = await buscarProximoAgendamento(telefone);
+        } catch (calErr) {
+          console.error('Erro ao buscar próximo agendamento:', calErr.message);
+        }
+
+        return res.status(200).json({
+          success: true,
+          atendimentos: result.rows,
+          proximo_agendamento: proximoAgendamento,
+        });
       }
 
       const result = await client.query(
