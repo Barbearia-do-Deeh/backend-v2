@@ -1,65 +1,10 @@
-const { google } = require('googleapis');
 const pool = require('../lib/db');
 const { PRECOS, saldoInicial, campoSaldo } = require('../lib/pacotes');
-
-const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
-const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
-const CALENDAR_ID = process.env.CALENDAR_ID || 'davidlucas261210@gmail.com';
 
 function addDias(data, dias) {
   const d = new Date(data);
   d.setDate(d.getDate() + dias);
   return d.toISOString().slice(0, 10);
-}
-
-function parseDescricao(desc) {
-  const result = { telefone: null };
-  if (!desc) return result;
-  const tel = desc.match(/WhatsApp:\s*(.+)/);
-  if (tel) result.telefone = tel[1].trim().replace(/\D/g, '');
-  return result;
-}
-
-function parseNomeServico(summary) {
-  const partes = (summary || '').split(' — ');
-  const servico = partes.length > 0 ? partes[0].replace(/^[^\p{L}]+/u, '').trim() : (summary || '');
-  return { servico };
-}
-
-async function buscarProximoAgendamento(telefone) {
-  const auth = new google.auth.JWT({
-    email: CLIENT_EMAIL,
-    key: PRIVATE_KEY,
-    scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
-  });
-  const calendar = google.calendar({ version: 'v3', auth });
-
-  const agora = new Date();
-  const daqui90dias = new Date(agora.getTime() + 90 * 24 * 60 * 60 * 1000);
-
-  const response = await calendar.events.list({
-    calendarId: CALENDAR_ID,
-    timeMin: agora.toISOString(),
-    timeMax: daqui90dias.toISOString(),
-    singleEvents: true,
-    orderBy: 'startTime',
-  });
-
-  const eventos = response.data.items || [];
-  const telefoneLimpo = (telefone || '').replace(/\D/g, '');
-
-  const evento = eventos.find((ev) => {
-    const { telefone: telEvento } = parseDescricao(ev.description);
-    return telEvento === telefoneLimpo && ev.start?.dateTime;
-  });
-
-  if (!evento) return null;
-
-  const { servico } = parseNomeServico(evento.summary);
-  return {
-    servico,
-    data_hora: evento.start.dateTime,
-  };
 }
 
 module.exports = async (req, res) => {
@@ -69,8 +14,63 @@ module.exports = async (req, res) => {
 
   if (req.method === 'OPTIONS') return res.status(200).end();
 
+  const { tipo } = req.query;
   const client = await pool.connect();
   try {
+    // ---- Produtos: listagem e comanda ----
+    if (tipo === 'produtos') {
+      if (req.method === 'GET') {
+        const result = await client.query(
+          `SELECT id, nome, descricao, preco, imagem_url FROM produtos WHERE ativo = true ORDER BY nome`
+        );
+        return res.status(200).json({ success: true, produtos: result.rows });
+      }
+
+      if (req.method === 'POST') {
+        const { telefone, data_hora, produtos } = req.body;
+        if (!telefone || !data_hora || !Array.isArray(produtos) || produtos.length === 0) {
+          return res.status(400).json({ error: 'telefone, data_hora e produtos (array) são obrigatórios' });
+        }
+
+        const ids = produtos.map(p => p.id);
+        const result = await client.query(
+          `SELECT id, nome, preco FROM produtos WHERE id = ANY($1::int[]) AND ativo = true`,
+          [ids]
+        );
+        const catalogo = new Map(result.rows.map(p => [p.id, p]));
+
+        let valorTotal = 0;
+        const itens = [];
+        for (const p of produtos) {
+          const info = catalogo.get(p.id);
+          if (!info) continue;
+          const quantidade = p.quantidade && p.quantidade > 0 ? p.quantidade : 1;
+          valorTotal += Number(info.preco) * quantidade;
+          itens.push({ id: info.id, nome: info.nome, preco: Number(info.preco), quantidade });
+        }
+
+        if (itens.length === 0) {
+          return res.status(400).json({ error: 'Nenhum produto válido encontrado' });
+        }
+
+        const comandaResult = await client.query(
+          `INSERT INTO comandas (telefone, data_hora, produtos, valor_total)
+           VALUES ($1, $2, $3, $4) RETURNING id`,
+          [telefone, data_hora, JSON.stringify(itens), valorTotal]
+        );
+
+        return res.status(200).json({
+          success: true,
+          comanda_id: comandaResult.rows[0].id,
+          itens,
+          valor_total: valorTotal,
+        });
+      }
+
+      return res.status(405).json({ error: 'Método não permitido' });
+    }
+
+    // ---- Atendimentos: comportamento original ----
     if (req.method === 'GET') {
       const { telefone } = req.query;
 
@@ -82,19 +82,7 @@ module.exports = async (req, res) => {
            ORDER BY a.data_hora DESC LIMIT 50`,
           [telefone]
         );
-
-        let proximoAgendamento = null;
-        try {
-          proximoAgendamento = await buscarProximoAgendamento(telefone);
-        } catch (calErr) {
-          console.error('Erro ao buscar próximo agendamento:', calErr.message);
-        }
-
-        return res.status(200).json({
-          success: true,
-          atendimentos: result.rows,
-          proximo_agendamento: proximoAgendamento,
-        });
+        return res.status(200).json({ success: true, atendimentos: result.rows });
       }
 
       const result = await client.query(
