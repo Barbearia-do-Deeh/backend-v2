@@ -1,4 +1,5 @@
 const { google } = require('googleapis');
+const pool = require('../lib/db');
 
 const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
@@ -13,8 +14,7 @@ module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Método não permitido' });
 
   try {
-    const { nome, telefone, servico, data, horario, duracao, preco } = req.body;
-
+    const { nome, telefone, servico, data, horario, duracao, preco, produtos } = req.body;
     if (!nome || !telefone || !servico || !data || !horario) {
       return res.status(400).json({ error: 'Dados incompletos' });
     }
@@ -24,7 +24,6 @@ module.exports = async (req, res) => {
       key: PRIVATE_KEY,
       scopes: ['https://www.googleapis.com/auth/calendar'],
     });
-
     const calendar = google.calendar({ version: 'v3', auth });
 
     // Montar data/hora do evento
@@ -44,9 +43,32 @@ module.exports = async (req, res) => {
     // já está no fuso de São Paulo (sem depender do fuso do servidor).
     const toISO = (d) => d.toISOString().replace('Z', '-03:00').slice(0, 19) + '-03:00';
 
+    // ---- Produtos: valida contra o catálogo e monta o resumo da comanda ----
+    let itensProduto = [];
+    let valorProdutos = 0;
+    if (Array.isArray(produtos) && produtos.length > 0) {
+      const ids = produtos.map(p => p.id);
+      const result = await pool.query(
+        `SELECT id, nome, preco FROM produtos WHERE id = ANY($1::int[]) AND ativo = true`,
+        [ids]
+      );
+      const catalogo = new Map(result.rows.map(p => [p.id, p]));
+      for (const p of produtos) {
+        const info = catalogo.get(p.id);
+        if (!info) continue;
+        const quantidade = p.quantidade && p.quantidade > 0 ? p.quantidade : 1;
+        valorProdutos += Number(info.preco) * quantidade;
+        itensProduto.push({ id: info.id, nome: info.nome, preco: Number(info.preco), quantidade });
+      }
+    }
+
+    const resumoProdutos = itensProduto.length
+      ? `\n🛍 Produtos: ${itensProduto.map(i => `${i.nome} x${i.quantidade}`).join(', ')} (R$ ${valorProdutos.toFixed(2).replace('.', ',')} — pago na hora)`
+      : '';
+
     const event = {
       summary: `✂️ ${servico} — ${nome}`,
-      description: `📱 WhatsApp: ${telefone}\n💈 Serviço: ${servico}\n💰 Valor: ${preco}\n⏱ Duração: ${duracao || '60 min'}`,
+      description: `📱 WhatsApp: ${telefone}\n💈 Serviço: ${servico}\n💰 Valor: ${preco}\n⏱ Duração: ${duracao || '60 min'}${resumoProdutos}`,
       location: 'Rua Seraphin Gilberto Candelo, 2063 – Jd. Morada do Sol',
       start: { dateTime: toISO(startUTC), timeZone: 'America/Sao_Paulo' },
       end: { dateTime: toISO(endUTC), timeZone: 'America/Sao_Paulo' },
@@ -65,10 +87,28 @@ module.exports = async (req, res) => {
       resource: event,
     });
 
+    // ---- Grava a comanda de produtos no Neon (best-effort: não derruba o agendamento) ----
+    let comandaId = null;
+    if (itensProduto.length > 0) {
+      try {
+        const comandaResult = await pool.query(
+          `INSERT INTO comandas (telefone, data_hora, produtos, valor_total)
+           VALUES ($1, $2, $3, $4) RETURNING id`,
+          [telefone, toISO(startUTC), JSON.stringify(itensProduto), valorProdutos]
+        );
+        comandaId = comandaResult.rows[0].id;
+      } catch (err) {
+        console.error('Erro ao salvar comanda de produtos:', err.message);
+      }
+    }
+
     return res.status(200).json({
       success: true,
       eventId: response.data.id,
       eventLink: response.data.htmlLink,
+      comanda_id: comandaId,
+      produtos: itensProduto,
+      valor_produtos: valorProdutos,
     });
 
   } catch (err) {
