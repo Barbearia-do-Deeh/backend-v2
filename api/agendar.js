@@ -5,6 +5,12 @@ const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
 const CALENDAR_ID = process.env.CALENDAR_ID || 'davidlucas261210@gmail.com';
 
+function addDias(data, dias) {
+  const d = new Date(data);
+  d.setDate(d.getDate() + dias);
+  return d.toISOString().slice(0, 10);
+}
+
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -18,6 +24,8 @@ module.exports = async (req, res) => {
     if (!nome || !telefone || !servico || !data || !horario) {
       return res.status(400).json({ error: 'Dados incompletos' });
     }
+
+    const telefoneLimpo = telefone.replace(/\D/g, '');
 
     const auth = new google.auth.JWT({
       email: CLIENT_EMAIL,
@@ -87,6 +95,30 @@ module.exports = async (req, res) => {
       resource: event,
     });
 
+    // ---- Garante que o cliente exista na tabela clientes (pra aparecer no admin) ----
+    // Best-effort: se der erro aqui, não derruba o agendamento (o evento já foi criado).
+    // Não mexe em plano/saldo de quem já existe — só atualiza o nome.
+    try {
+      const hoje = new Date().toISOString().slice(0, 10);
+      const fim = addDias(hoje, 30);
+      const clienteResult = await pool.query(
+        `INSERT INTO clientes (nome, telefone, plano, subtipo_essencial, data_inicio_ciclo, data_fim_ciclo)
+         VALUES ($1, $2, 'nenhum', NULL, $3, $4)
+         ON CONFLICT (telefone) DO UPDATE SET nome = EXCLUDED.nome
+         RETURNING id`,
+        [nome, telefoneLimpo, hoje, fim]
+      );
+      const clienteId = clienteResult.rows[0].id;
+      await pool.query(
+        `INSERT INTO saldo_ciclo (cliente_id, cortes_restantes, barbas_restantes, pezinhos_restantes, sobrancelha_restante)
+         VALUES ($1, 0, 0, 0, false)
+         ON CONFLICT (cliente_id) DO NOTHING`,
+        [clienteId]
+      );
+    } catch (err) {
+      console.error('Erro ao gravar cliente:', err.message);
+    }
+
     // ---- Grava a comanda de produtos no Neon (best-effort: não derruba o agendamento) ----
     let comandaId = null;
     if (itensProduto.length > 0) {
@@ -94,7 +126,7 @@ module.exports = async (req, res) => {
         const comandaResult = await pool.query(
           `INSERT INTO comandas (telefone, data_hora, produtos, valor_total)
            VALUES ($1, $2, $3, $4) RETURNING id`,
-          [telefone, toISO(startUTC), JSON.stringify(itensProduto), valorProdutos]
+          [telefoneLimpo, toISO(startUTC), JSON.stringify(itensProduto), valorProdutos]
         );
         comandaId = comandaResult.rows[0].id;
       } catch (err) {
