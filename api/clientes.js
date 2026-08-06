@@ -40,7 +40,7 @@ module.exports = async (req, res) => {
   const client = await pool.connect();
   try {
     if (req.method === 'POST') {
-      const { nome, telefone, plano, subtipo_essencial } = req.body;
+      const { nome, telefone, plano, subtipo_essencial, valor_pacote } = req.body;
 
       if (!nome || !telefone) {
         return res.status(400).json({ error: 'nome e telefone são obrigatórios' });
@@ -50,17 +50,19 @@ module.exports = async (req, res) => {
       const hoje = new Date().toISOString().slice(0, 10);
       const fim = addDias(hoje, 30);
       const saldo = saldoInicial(planoFinal, subtipo_essencial);
+      const valorPacoteFinal = valor_pacote === '' || valor_pacote === undefined ? null : valor_pacote;
 
       const clienteResult = await client.query(
-        `INSERT INTO clientes (nome, telefone, plano, subtipo_essencial, data_inicio_ciclo, data_fim_ciclo)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO clientes (nome, telefone, plano, subtipo_essencial, valor_pacote, data_inicio_ciclo, data_fim_ciclo)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (telefone) DO UPDATE SET
            nome = EXCLUDED.nome, plano = EXCLUDED.plano,
            subtipo_essencial = EXCLUDED.subtipo_essencial,
+           valor_pacote = EXCLUDED.valor_pacote,
            data_inicio_ciclo = EXCLUDED.data_inicio_ciclo,
            data_fim_ciclo = EXCLUDED.data_fim_ciclo
          RETURNING id`,
-        [nome, telefone, planoFinal, subtipo_essencial || null, hoje, fim]
+        [nome, telefone, planoFinal, subtipo_essencial || null, valorPacoteFinal, hoje, fim]
       );
       const clienteId = clienteResult.rows[0].id;
 
@@ -116,7 +118,7 @@ module.exports = async (req, res) => {
     }
 
     if (req.method === 'PUT') {
-      const { id, nome, telefone, plano, subtipo_essencial,
+      const { id, nome, telefone, plano, subtipo_essencial, valor_pacote,
         cortes_restantes, barbas_restantes, pezinhos_restantes, sobrancelha_restante } = req.body;
 
       if (!id) {
@@ -132,6 +134,10 @@ module.exports = async (req, res) => {
       if (telefone !== undefined) { clienteFields.push(`telefone = $${i++}`); clienteValues.push(telefone); }
       if (plano !== undefined) { clienteFields.push(`plano = $${i++}`); clienteValues.push(plano); }
       if (subtipo_essencial !== undefined) { clienteFields.push(`subtipo_essencial = $${i++}`); clienteValues.push(subtipo_essencial); }
+      if (valor_pacote !== undefined) {
+        clienteFields.push(`valor_pacote = $${i++}`);
+        clienteValues.push(valor_pacote === '' || valor_pacote === null ? null : valor_pacote);
+      }
 
       if (clienteFields.length > 0) {
         clienteValues.push(id);
