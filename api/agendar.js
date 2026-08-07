@@ -1,9 +1,17 @@
 const { google } = require('googleapis');
+const webpush = require('web-push');
 const pool = require('../lib/db');
 
 const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
 const CALENDAR_ID = process.env.CALENDAR_ID || 'davidlucas261210@gmail.com';
+
+const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
+const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:contato@barbeariadodeeh.com';
+const ADMIN_TELEFONE = '5519993900880'; // mesmo identificador usado no admin.html pra se inscrever
+
+webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 
 function addDias(data, dias) {
   const d = new Date(data);
@@ -94,6 +102,26 @@ module.exports = async (req, res) => {
       calendarId: CALENDAR_ID,
       resource: event,
     });
+
+    // ---- Notifica o Deeh na hora (não espera o Google Calendar sincronizar) ----
+    // Best-effort: se não tiver inscrição push ainda ou der erro, não derruba o agendamento.
+    try {
+      const subRow = await pool.query(
+        'SELECT subscription FROM push_subscriptions WHERE telefone = $1',
+        [ADMIN_TELEFONE]
+      );
+      if (subRow.rows.length > 0) {
+        const horaFmt = horario;
+        const pushPayload = JSON.stringify({
+          title: 'Novo agendamento! ✂️',
+          body: `${nome} marcou ${servico} pra ${data} às ${horaFmt}.`,
+          icon: '/icon-192.png',
+        });
+        await webpush.sendNotification(subRow.rows[0].subscription, pushPayload);
+      }
+    } catch (err) {
+      console.error('Erro ao enviar push de novo agendamento:', err.message);
+    }
 
     // ---- Garante que o cliente exista na tabela clientes (pra aparecer no admin) ----
     // Best-effort: se der erro aqui, não derruba o agendamento (o evento já foi criado).
