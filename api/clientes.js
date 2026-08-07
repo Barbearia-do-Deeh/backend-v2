@@ -55,12 +55,7 @@ module.exports = async (req, res) => {
       const clienteResult = await client.query(
         `INSERT INTO clientes (nome, telefone, plano, subtipo_essencial, valor_pacote, data_inicio_ciclo, data_fim_ciclo)
          VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (telefone) DO UPDATE SET
-           nome = EXCLUDED.nome, plano = EXCLUDED.plano,
-           subtipo_essencial = EXCLUDED.subtipo_essencial,
-           valor_pacote = EXCLUDED.valor_pacote,
-           data_inicio_ciclo = EXCLUDED.data_inicio_ciclo,
-           data_fim_ciclo = EXCLUDED.data_fim_ciclo
+         ON CONFLICT (telefone) DO UPDATE SET nome = EXCLUDED.nome
          RETURNING id`,
         [nome, telefone, planoFinal, subtipo_essencial || null, valorPacoteFinal, hoje, fim]
       );
@@ -69,11 +64,7 @@ module.exports = async (req, res) => {
       await client.query(
         `INSERT INTO saldo_ciclo (cliente_id, cortes_restantes, barbas_restantes, pezinhos_restantes, sobrancelha_restante)
          VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (cliente_id) DO UPDATE SET
-           cortes_restantes = EXCLUDED.cortes_restantes,
-           barbas_restantes = EXCLUDED.barbas_restantes,
-           pezinhos_restantes = EXCLUDED.pezinhos_restantes,
-           sobrancelha_restante = EXCLUDED.sobrancelha_restante`,
+         ON CONFLICT (cliente_id) DO NOTHING`,
         [clienteId, saldo.cortes_restantes, saldo.barbas_restantes, saldo.pezinhos_restantes, saldo.sobrancelha_restante]
       );
 
