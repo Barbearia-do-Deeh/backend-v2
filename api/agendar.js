@@ -70,6 +70,49 @@ async function listarMeusAgendamentos(req, res) {
   return res.status(200).json({ success: true, agendamentos });
 }
 
+// ---- Fila de espera: avisa quem estava esperando vaga nesse dia (best-effort) ----
+// Só marca como notificado quando o push realmente é enviado com sucesso — se o
+// cliente ainda não tiver se inscrito em push_subscriptions, fica pendente e tenta
+// de novo no próximo cancelamento daquele dia (sem custo real, é só um SELECT vazio).
+function extrairDataDDMMAAAA(evento) {
+  const startStr = evento.start?.dateTime || evento.start?.date || '';
+  const dataPart = startStr.split('T')[0];
+  const [ano, mes, dia] = (dataPart || '').split('-');
+  if (!ano || !mes || !dia) return null;
+  return `${dia}/${mes}/${ano}`;
+}
+
+async function notificarFilaEspera(evento) {
+  const dataStr = extrairDataDDMMAAAA(evento);
+  if (!dataStr) return;
+
+  const filaResult = await pool.query(
+    `SELECT id, telefone, nome, servico FROM fila_espera WHERE data = $1 AND notificado = false`,
+    [dataStr]
+  );
+  if (!filaResult.rows.length) return;
+
+  for (const item of filaResult.rows) {
+    try {
+      const subRow = await pool.query(
+        'SELECT subscription FROM push_subscriptions WHERE telefone = $1',
+        [item.telefone]
+      );
+      if (subRow.rows.length === 0) continue; // ainda sem inscrição push, tenta de novo depois
+
+      const payload = JSON.stringify({
+        title: 'Vaga aberta! ✂️',
+        body: `${item.nome ? item.nome + ', abriu' : 'Abriu'} um horário no dia ${dataStr}${item.servico ? ' pra ' + item.servico : ''}. Corre lá no app!`,
+        icon: '/icon-192.png',
+      });
+      await webpush.sendNotification(subRow.rows[0].subscription, payload);
+      await pool.query('UPDATE fila_espera SET notificado = true WHERE id = $1', [item.id]);
+    } catch (err) {
+      console.error('Erro ao notificar fila de espera do telefone', item.telefone, err.message);
+    }
+  }
+}
+
 // ---- POST ?tipo=cancelar { eventId, telefone } ----
 // Confirma que o telefone bate com o dono do evento antes de apagar do Calendar.
 async function cancelarAgendamento(req, res) {
@@ -95,6 +138,31 @@ async function cancelarAgendamento(req, res) {
   }
 
   await calendar.events.delete({ calendarId: CALENDAR_ID, eventId });
+
+  // Best-effort: não derruba a resposta do cancelamento se a notificação da fila falhar.
+  try {
+    await notificarFilaEspera(evento);
+  } catch (err) {
+    console.error('Erro ao notificar fila de espera:', err.message);
+  }
+
+  return res.status(200).json({ success: true });
+}
+
+// ---- POST ?tipo=fila-espera { nome, telefone, data, servico } ----
+// Cliente pede pra ser avisado se abrir uma vaga num dia sem horários disponíveis.
+async function entrarNaFila(req, res) {
+  const { nome, telefone, data, servico } = req.body;
+  if (!nome || !telefone || !data) {
+    return res.status(400).json({ error: 'nome, telefone e data são obrigatórios' });
+  }
+  const telefoneLimpo = telefone.replace(/\D/g, '');
+
+  await pool.query(
+    `INSERT INTO fila_espera (nome, telefone, data, servico) VALUES ($1, $2, $3, $4)`,
+    [nome, telefoneLimpo, data, servico || null]
+  );
+
   return res.status(200).json({ success: true });
 }
 
@@ -265,6 +333,7 @@ module.exports = async (req, res) => {
 
     if (req.method === 'POST') {
       if (tipo === 'cancelar') return await cancelarAgendamento(req, res);
+      if (tipo === 'fila-espera') return await entrarNaFila(req, res);
       return await criarAgendamento(req, res);
     }
 
