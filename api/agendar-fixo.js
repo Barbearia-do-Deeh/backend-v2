@@ -1,8 +1,9 @@
 const { google } = require('googleapis');
+const { ENDERECO, CALENDAR_ID_PADRAO } = require('../lib/config-negocio');
 
 const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
-const CALENDAR_ID = process.env.CALENDAR_ID || 'davidlucas261210@gmail.com';
+const CALENDAR_ID = process.env.CALENDAR_ID || CALENDAR_ID_PADRAO;
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -40,7 +41,7 @@ module.exports = async (req, res) => {
     const event = {
       summary: `✂️ ${servico} — ${nome} (fixo)`,
       description: `📱 WhatsApp: ${telefone}\n💈 Serviço: ${servico}\n💰 Valor: ${preco || 'incluso no pacote'}\n⏱ Duração: ${duracao || '60 min'}\n🔁 Horário fixo semanal`,
-      location: 'Rua Seraphin Gilberto Candelo, 2063 – Jd. Morada do Sol',
+      location: ENDERECO,
       start: { dateTime: toISO(startUTC), timeZone: 'America/Sao_Paulo' },
       end: { dateTime: toISO(endUTC), timeZone: 'America/Sao_Paulo' },
       recurrence: [`RRULE:FREQ=WEEKLY;COUNT=${count}`],
