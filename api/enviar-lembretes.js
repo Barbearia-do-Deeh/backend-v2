@@ -9,10 +9,11 @@
 const { google } = require('googleapis');
 const webpush = require('web-push');
 const pool = require('../lib/db');
+const { NOME, CALENDAR_ID_PADRAO, VAPID_SUBJECT_PADRAO } = require('../lib/config-negocio');
 
 const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
-const CALENDAR_ID = process.env.CALENDAR_ID || 'davidlucas261210@gmail.com';
+const CALENDAR_ID = process.env.CALENDAR_ID || CALENDAR_ID_PADRAO;
 const CRON_SECRET = process.env.CRON_SECRET;
 const REMINDER_HOURS = parseFloat(process.env.REMINDER_HOURS || '3');
 const INTERVAL_MINUTES = parseFloat(process.env.CRON_INTERVAL_MINUTES || '15');
@@ -21,7 +22,7 @@ const REVIEW_URL = 'https://share.google/zfVJVDrPgBTdu0j6u';
 
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
-const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:contato@barbeariadodeeh.com';
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || VAPID_SUBJECT_PADRAO;
 
 webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 
@@ -61,6 +62,11 @@ module.exports = async (req, res) => {
   // Modo avaliação pós-atendimento (chamado pelo cron, igual ao lembrete)
   if (req.query.tipo === 'avaliacao') {
     return enviarAvaliacoes(req, res);
+  }
+
+  // Modo aniversário (chamado pelo cron 1x/dia — ver comentário na função)
+  if (req.query.tipo === 'aniversario') {
+    return enviarAniversarios(req, res);
   }
 
   try {
@@ -113,7 +119,7 @@ module.exports = async (req, res) => {
       });
 
       const payload = JSON.stringify({
-        title: 'Barbearia do Deeh',
+        title: NOME,
         body: `${nome ? nome + ', seu' : 'Seu'} horário de ${servico || 'atendimento'} é hoje às ${horaEvento}. Te esperamos!`,
         icon: '/icon-192.png',
       });
@@ -146,10 +152,15 @@ module.exports = async (req, res) => {
 
 // ---- Notificação manual (broadcast) ----
 // POST /api/enviar-lembretes?tipo=broadcast&secret=SEU_CRON_SECRET
-// Body: { titulo, mensagem, filtro: 'todos' | 'plano' | 'manual', valor }
-//   filtro 'todos'  -> valor ignorado, manda pra todo mundo inscrito em push
-//   filtro 'plano'  -> valor = 'essencial' | 'classico' | 'empresario'
-//   filtro 'manual' -> valor = array de telefones (ex: ['5519999999999', ...])
+// Body: { titulo, mensagem, filtro, valor }
+//   filtro 'todos'                -> valor ignorado, manda pra todo mundo inscrito em push
+//   filtro 'plano'                -> valor = 'essencial' | 'classico' | 'empresario'
+//   filtro 'manual'               -> valor = array de telefones (ex: ['5519999999999', ...])
+//   filtro 'aniversariantes_hoje' -> valor ignorado, clientes com data_nascimento = hoje (dia+mês)
+//   filtro 'aniversariantes_mes'  -> valor ignorado, clientes com data_nascimento no mês atual
+// Os dois filtros de aniversariante existem pra você mandar manualmente uma mensagem com
+// cupom/desconto quando quiser — o envio automático diário (?tipo=aniversario) é só parabéns,
+// sem cupom nenhum.
 async function enviarBroadcast(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ success: false, error: 'Use POST para enviar notificações manuais' });
@@ -175,6 +186,21 @@ async function enviarBroadcast(req, res) {
       }
       const result = await pool.query('SELECT telefone FROM clientes WHERE plano = $1', [valor]);
       telefones = result.rows.map((r) => r.telefone);
+    } else if (filtro === 'aniversariantes_hoje') {
+      const result = await pool.query(
+        `SELECT telefone FROM clientes
+         WHERE data_nascimento IS NOT NULL
+           AND EXTRACT(MONTH FROM data_nascimento) = EXTRACT(MONTH FROM CURRENT_DATE)
+           AND EXTRACT(DAY FROM data_nascimento) = EXTRACT(DAY FROM CURRENT_DATE)`
+      );
+      telefones = result.rows.map((r) => r.telefone);
+    } else if (filtro === 'aniversariantes_mes') {
+      const result = await pool.query(
+        `SELECT telefone FROM clientes
+         WHERE data_nascimento IS NOT NULL
+           AND EXTRACT(MONTH FROM data_nascimento) = EXTRACT(MONTH FROM CURRENT_DATE)`
+      );
+      telefones = result.rows.map((r) => r.telefone);
     } else {
       // 'todos' — todo mundo que já se inscreveu pra push
       const result = await pool.query('SELECT telefone FROM push_subscriptions');
@@ -198,7 +224,7 @@ async function enviarBroadcast(req, res) {
     );
 
     const payload = JSON.stringify({
-      title: (titulo && titulo.trim()) || 'Barbearia do Deeh',
+      title: (titulo && titulo.trim()) || NOME,
       body: mensagem.trim(),
       icon: '/icon-192.png',
     });
@@ -283,7 +309,7 @@ async function enviarAvaliacoes(req, res) {
 
       const payload = JSON.stringify({
         title: 'Como foi seu atendimento? ⭐',
-        body: `${nome ? nome + ', queremos' : 'Queremos'} saber sua opinião! Toque pra avaliar a Barbearia do Deeh.`,
+        body: `${nome ? nome + ', queremos' : 'Queremos'} saber sua opinião! Toque pra avaliar a ${NOME}.`,
         icon: '/icon-192.png',
         url: REVIEW_URL,
       });
@@ -309,6 +335,79 @@ async function enviarAvaliacoes(req, res) {
     });
   } catch (err) {
     console.error('Erro ao enviar avaliações:', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+}
+
+// ---- Aniversário (automático, sem cupom) ----
+// GET /api/enviar-lembretes?tipo=aniversario&secret=SEU_CRON_SECRET
+// Chamado pelo cron 1x por dia (não precisa dos 15 em 15 min dos outros modos —
+// aniversário não é sensível a horário). Busca clientes com data_nascimento = hoje
+// (dia + mês, ignorando o ano) e manda um push de parabéns fixo, sem cupom.
+// Dedupe por (telefone, ano) via tabela aniversarios_enviados, pra não mandar de
+// novo se o cron rodar mais de uma vez no mesmo dia.
+//
+// Quer mandar cupom/desconto pro aniversariante? Use a aba Avisos do admin.html com
+// o filtro "Aniversariantes de hoje" ou "Aniversariantes do mês" — esse envio manual
+// é separado e não interfere no automático daqui.
+async function enviarAniversarios(req, res) {
+  try {
+    const anoAtual = new Date().getFullYear();
+
+    const clientesResult = await pool.query(
+      `SELECT nome, telefone FROM clientes
+       WHERE data_nascimento IS NOT NULL
+         AND EXTRACT(MONTH FROM data_nascimento) = EXTRACT(MONTH FROM CURRENT_DATE)
+         AND EXTRACT(DAY FROM data_nascimento) = EXTRACT(DAY FROM CURRENT_DATE)`
+    );
+
+    let enviados = 0;
+    let pulados = 0;
+    const erros = [];
+
+    for (const cliente of clientesResult.rows) {
+      const jaEnviado = await pool.query(
+        'SELECT 1 FROM aniversarios_enviados WHERE telefone = $1 AND ano = $2',
+        [cliente.telefone, anoAtual]
+      );
+      if (jaEnviado.rows.length > 0) { pulados++; continue; }
+
+      const subRow = await pool.query(
+        'SELECT subscription FROM push_subscriptions WHERE telefone = $1',
+        [cliente.telefone]
+      );
+      if (subRow.rows.length === 0) continue; // cliente não tem inscrição de push
+
+      // Mensagem fixa de parabéns — SEM cupom. Se quiser incluir cupom aqui de forma
+      // permanente, é só editar o "body" abaixo (mas o combinado é usar o broadcast
+      // manual da aba Avisos pra isso, já que o cupom não é sempre o mesmo).
+      const payload = JSON.stringify({
+        title: 'Feliz Aniversário! 🎉',
+        body: `${cliente.nome ? cliente.nome + ', a' : 'A'} equipe da ${NOME} deseja um feliz aniversário! 🎂`,
+        icon: '/icon-192.png',
+      });
+
+      try {
+        await webpush.sendNotification(subRow.rows[0].subscription, payload);
+        await pool.query(
+          'INSERT INTO aniversarios_enviados (telefone, ano) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+          [cliente.telefone, anoAtual]
+        );
+        enviados++;
+      } catch (pushErr) {
+        erros.push({ telefone: cliente.telefone, erro: pushErr.message });
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      verificados: clientesResult.rows.length,
+      enviados,
+      pulados,
+      erros,
+    });
+  } catch (err) {
+    console.error('Erro ao enviar aniversários:', err.message);
     return res.status(500).json({ success: false, error: err.message });
   }
 }
