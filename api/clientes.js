@@ -30,6 +30,84 @@ async function renovarCicloSeVencido(client, cliente) {
   return false;
 }
 
+// ---- Barbeiros ----
+// Embutido neste arquivo (não em api/barbeiros.js) porque o backend-v2 já está no
+// teto de 12 Serverless Functions do plano Hobby da Vercel. Acessado via
+// ?recurso=barbeiros nas mesmas rotas GET/POST/PUT de sempre.
+async function handleBarbeiros(req, res, client) {
+  if (req.method === 'GET') {
+    const result = await client.query('SELECT * FROM barbeiros ORDER BY nome');
+    return res.status(200).json({ success: true, barbeiros: result.rows });
+  }
+
+  if (req.method === 'POST') {
+    const { nome, regime, comissao_servico_pct, aluguel_fixo_valor, comissao_produtos_pct } = req.body;
+
+    if (!nome || !regime) {
+      return res.status(400).json({ error: 'nome e regime são obrigatórios' });
+    }
+    if (regime !== 'comissao' && regime !== 'aluguel') {
+      return res.status(400).json({ error: 'regime deve ser "comissao" ou "aluguel"' });
+    }
+
+    const result = await client.query(
+      `INSERT INTO barbeiros (nome, regime, comissao_servico_pct, aluguel_fixo_valor, comissao_produtos_pct)
+       VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [
+        nome,
+        regime,
+        regime === 'comissao' ? (comissao_servico_pct === '' || comissao_servico_pct === undefined ? null : comissao_servico_pct) : null,
+        regime === 'aluguel' ? (aluguel_fixo_valor === '' || aluguel_fixo_valor === undefined ? null : aluguel_fixo_valor) : null,
+        comissao_produtos_pct === '' || comissao_produtos_pct === undefined ? 0 : comissao_produtos_pct,
+      ]
+    );
+
+    return res.status(200).json({ success: true, barbeiro_id: result.rows[0].id });
+  }
+
+  if (req.method === 'PUT') {
+    const { id, nome, regime, comissao_servico_pct, aluguel_fixo_valor, comissao_produtos_pct, ativo } = req.body;
+
+    if (!id) {
+      return res.status(400).json({ error: 'id é obrigatório' });
+    }
+    if (regime !== undefined && regime !== 'comissao' && regime !== 'aluguel') {
+      return res.status(400).json({ error: 'regime deve ser "comissao" ou "aluguel"' });
+    }
+
+    const fields = [];
+    const values = [];
+    let i = 1;
+    if (nome !== undefined) { fields.push(`nome = $${i++}`); values.push(nome); }
+    if (regime !== undefined) { fields.push(`regime = $${i++}`); values.push(regime); }
+    if (comissao_servico_pct !== undefined) {
+      fields.push(`comissao_servico_pct = $${i++}`);
+      values.push(comissao_servico_pct === '' ? null : comissao_servico_pct);
+    }
+    if (aluguel_fixo_valor !== undefined) {
+      fields.push(`aluguel_fixo_valor = $${i++}`);
+      values.push(aluguel_fixo_valor === '' ? null : aluguel_fixo_valor);
+    }
+    if (comissao_produtos_pct !== undefined) {
+      fields.push(`comissao_produtos_pct = $${i++}`);
+      values.push(comissao_produtos_pct === '' ? 0 : comissao_produtos_pct);
+    }
+    if (ativo !== undefined) { fields.push(`ativo = $${i++}`); values.push(ativo); }
+
+    if (!fields.length) {
+      return res.status(400).json({ error: 'Nada para atualizar' });
+    }
+
+    values.push(id);
+    await client.query(`UPDATE barbeiros SET ${fields.join(', ')} WHERE id = $${i}`, values);
+
+    const atualizado = await client.query('SELECT * FROM barbeiros WHERE id = $1', [id]);
+    return res.status(200).json({ success: true, barbeiro: atualizado.rows[0] });
+  }
+
+  return res.status(405).json({ error: 'Método não permitido' });
+}
+
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
@@ -39,8 +117,13 @@ module.exports = async (req, res) => {
 
   const client = await pool.connect();
   try {
+    if (req.query.recurso === 'barbeiros') {
+      return await handleBarbeiros(req, res, client);
+    }
+
     if (req.method === 'POST') {
       const { nome, telefone, plano, subtipo_essencial, valor_pacote, data_nascimento } = req.body;
+
 
       if (!nome || !telefone) {
         return res.status(400).json({ error: 'nome e telefone são obrigatórios' });
