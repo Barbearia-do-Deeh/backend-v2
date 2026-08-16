@@ -36,6 +36,15 @@ async function renovarCicloSeVencido(client, cliente) {
 // ?recurso=barbeiros nas mesmas rotas GET/POST/PUT de sempre.
 async function handleBarbeiros(req, res, client) {
   if (req.method === 'GET') {
+    // ?publico=1 é usado pelo index.html (fluxo de agendamento do cliente) — só nome
+    // e id de quem está ativo, nunca comissão/aluguel (dado financeiro fica só no admin)
+    if (req.query.publico === '1') {
+      const result = await client.query(
+        'SELECT id, nome FROM barbeiros WHERE ativo = true ORDER BY nome'
+      );
+      return res.status(200).json({ success: true, barbeiros: result.rows });
+    }
+
     const result = await client.query('SELECT * FROM barbeiros ORDER BY nome');
     return res.status(200).json({ success: true, barbeiros: result.rows });
   }
