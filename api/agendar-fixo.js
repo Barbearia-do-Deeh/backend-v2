@@ -14,7 +14,7 @@ module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Método não permitido' });
 
   try {
-    const { nome, telefone, servico, dataInicio, horario, duracao, preco, repeticoes } = req.body;
+    const { nome, telefone, servico, dataInicio, horario, duracao, preco, repeticoes, barbeiro_id } = req.body;
 
     if (!nome || !telefone || !servico || !dataInicio || !horario) {
       return res.status(400).json({ error: 'Dados incompletos' });
@@ -52,6 +52,16 @@ module.exports = async (req, res) => {
           { method: 'popup', minutes: 60 },
           { method: 'popup', minutes: 15 },
         ],
+      },
+      // Mesmos dados estruturados do agendamento avulso — sem isso, um horário fixo
+      // não aparece como ocupado no filtro por barbeiro de disponibilidade.js.
+      extendedProperties: {
+        private: {
+          telefone: telefone.replace(/\D/g, ''),
+          servico,
+          preco: preco || '',
+          ...(barbeiro_id ? { barbeiro_id: String(barbeiro_id) } : {}),
+        },
       },
     };
 
