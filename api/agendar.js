@@ -1,15 +1,16 @@
 const { google } = require('googleapis');
 const webpush = require('web-push');
 const pool = require('../lib/db');
+const { ENDERECO, WHATSAPP_ADMIN, CALENDAR_ID_PADRAO, VAPID_SUBJECT_PADRAO } = require('../lib/config-negocio');
 
 const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
-const CALENDAR_ID = process.env.CALENDAR_ID || 'davidlucas261210@gmail.com';
+const CALENDAR_ID = process.env.CALENDAR_ID || CALENDAR_ID_PADRAO;
 
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY;
-const VAPID_SUBJECT = process.env.VAPID_SUBJECT || 'mailto:contato@barbeariadodeeh.com';
-const ADMIN_TELEFONE = '5519993900880'; // mesmo identificador usado no admin.html pra se inscrever
+const VAPID_SUBJECT = process.env.VAPID_SUBJECT || VAPID_SUBJECT_PADRAO;
+const ADMIN_TELEFONE = WHATSAPP_ADMIN; // mesmo identificador usado no admin.html pra se inscrever
 
 webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 
@@ -168,7 +169,7 @@ async function entrarNaFila(req, res) {
 
 // ---- POST (padrão, sem tipo) — criar agendamento ----
 async function criarAgendamento(req, res) {
-  const { nome, telefone, servico, data, horario, duracao, preco, produtos } = req.body;
+  const { nome, telefone, servico, data, horario, duracao, preco, produtos, barbeiro_id } = req.body;
   if (!nome || !telefone || !servico || !data || !horario) {
     return res.status(400).json({ error: 'Dados incompletos' });
   }
@@ -217,10 +218,22 @@ async function criarAgendamento(req, res) {
     ? `\n🛍 Produtos: ${itensProduto.map(i => `${i.nome} x${i.quantidade}`).join(', ')} (R$ ${valorProdutos.toFixed(2).replace('.', ',')} — pago na hora)`
     : '';
 
+  // ---- Nome do barbeiro (só pra description do evento — o filtro real usa barbeiro_id) ----
+  let nomeBarbeiro = '';
+  if (barbeiro_id) {
+    try {
+      const barbeiroResult = await pool.query('SELECT nome FROM barbeiros WHERE id = $1', [barbeiro_id]);
+      if (barbeiroResult.rows.length > 0) nomeBarbeiro = barbeiroResult.rows[0].nome;
+    } catch (err) {
+      console.error('Erro ao buscar nome do barbeiro:', err.message);
+    }
+  }
+  const resumoBarbeiro = nomeBarbeiro ? `\n✂️ Profissional: ${nomeBarbeiro}` : '';
+
   const event = {
     summary: `✂️ ${servico} — ${nome}`,
-    description: `📱 WhatsApp: ${telefone}\n💈 Serviço: ${servico}\n💰 Valor: ${preco}\n⏱ Duração: ${duracao || '60 min'}${resumoProdutos}`,
-    location: 'Rua Seraphin Gilberto Candelo, 2063 – Jd. Morada do Sol',
+    description: `📱 WhatsApp: ${telefone}\n💈 Serviço: ${servico}\n💰 Valor: ${preco}\n⏱ Duração: ${duracao || '60 min'}${resumoBarbeiro}${resumoProdutos}`,
+    location: ENDERECO,
     start: { dateTime: toISO(startUTC), timeZone: 'America/Sao_Paulo' },
     end: { dateTime: toISO(endUTC), timeZone: 'America/Sao_Paulo' },
     colorId: '5', // Banana (amarelo)
@@ -238,6 +251,7 @@ async function criarAgendamento(req, res) {
         telefone: telefoneLimpo,
         servico,
         preco: preco || '',
+        ...(barbeiro_id ? { barbeiro_id: String(barbeiro_id) } : {}),
       },
     },
   };
