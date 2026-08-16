@@ -27,7 +27,7 @@ module.exports = async (req, res) => {
       }
 
       if (req.method === 'POST') {
-        const { telefone, data_hora, produtos } = req.body;
+        const { telefone, data_hora, produtos, barbeiro_id } = req.body;
         if (!telefone || !data_hora || !Array.isArray(produtos) || produtos.length === 0) {
           return res.status(400).json({ error: 'telefone, data_hora e produtos (array) são obrigatórios' });
         }
@@ -54,9 +54,9 @@ module.exports = async (req, res) => {
         }
 
         const comandaResult = await client.query(
-          `INSERT INTO comandas (telefone, data_hora, produtos, valor_total)
-           VALUES ($1, $2, $3, $4) RETURNING id`,
-          [telefone, data_hora, JSON.stringify(itens), valorTotal]
+          `INSERT INTO comandas (telefone, data_hora, produtos, valor_total, barbeiro_id)
+           VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+          [telefone, data_hora, JSON.stringify(itens), valorTotal, barbeiro_id || null]
         );
 
         return res.status(200).json({
