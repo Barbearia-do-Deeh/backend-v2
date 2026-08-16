@@ -56,6 +56,7 @@ async function calcularFechamentoBarbeiros(client, { mes, ano }) {
       const priv = ev.extendedProperties?.private || {};
       const barbeiroId = priv.barbeiro_id;
       if (!barbeiroId) continue; // sem barbeiro marcado (bloqueio geral, ou evento antigo)
+      if (priv.status === 'faltou') continue; // cliente não veio — não conta como receita/comissão
       const valor = parsePreco(priv.preco);
       receitaServicosPorBarbeiro[barbeiroId] = (receitaServicosPorBarbeiro[barbeiroId] || 0) + valor;
     }
