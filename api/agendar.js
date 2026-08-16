@@ -310,9 +310,9 @@ async function criarAgendamento(req, res) {
   if (itensProduto.length > 0) {
     try {
       const comandaResult = await pool.query(
-        `INSERT INTO comandas (telefone, data_hora, produtos, valor_total)
-         VALUES ($1, $2, $3, $4) RETURNING id`,
-        [telefoneLimpo, toISO(startUTC), JSON.stringify(itensProduto), valorProdutos]
+        `INSERT INTO comandas (telefone, data_hora, produtos, valor_total, barbeiro_id)
+         VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+        [telefoneLimpo, toISO(startUTC), JSON.stringify(itensProduto), valorProdutos, barbeiro_id || null]
       );
       comandaId = comandaResult.rows[0].id;
     } catch (err) {
