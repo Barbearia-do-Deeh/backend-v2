@@ -65,6 +65,7 @@ async function listarMeusAgendamentos(req, res) {
       data: dia && mes && ano ? `${dia}/${mes}/${ano}` : null,
       horario,
       preco: priv.preco || null,
+      status: priv.status || 'pendente',
     };
   });
 
@@ -87,9 +88,17 @@ async function notificarFilaEspera(evento) {
   const dataStr = extrairDataDDMMAAAA(evento);
   if (!dataStr) return;
 
+  // Barbeiro do horário que abriu (pode ser null se o evento não tinha marcado).
+  const barbeiroDoEvento = evento.extendedProperties?.private?.barbeiro_id || null;
+
+  // Só avisa quem estava esperando ESSE barbeiro específico, ou quem entrou na fila
+  // sem se importar com qual barbeiro (barbeiro_id nulo — inclui todo mundo que
+  // entrou na fila antes dessa funcionalidade existir).
   const filaResult = await pool.query(
-    `SELECT id, telefone, nome, servico FROM fila_espera WHERE data = $1 AND notificado = false`,
-    [dataStr]
+    `SELECT id, telefone, nome, servico FROM fila_espera
+     WHERE data = $1 AND notificado = false
+       AND (barbeiro_id IS NULL OR barbeiro_id::text = $2)`,
+    [dataStr, barbeiroDoEvento]
   );
   if (!filaResult.rows.length) return;
 
@@ -150,18 +159,57 @@ async function cancelarAgendamento(req, res) {
   return res.status(200).json({ success: true });
 }
 
+// ---- POST ?tipo=confirmar { eventId, telefone } ----
+// Cliente confirma presença a partir do push enviado ~1 dia antes (ver
+// enviarConfirmacoes em enviar-lembretes.js). Mesma verificação de dono do
+// cancelarAgendamento — só que aqui só atualiza o status, não apaga nada.
+async function confirmarPresenca(req, res) {
+  const { eventId, telefone } = req.body;
+  if (!eventId || !telefone) {
+    return res.status(400).json({ error: 'eventId e telefone são obrigatórios' });
+  }
+  const telefoneLimpo = telefone.replace(/\D/g, '');
+
+  const calendar = getCalendarClient();
+
+  let evento;
+  try {
+    const evResp = await calendar.events.get({ calendarId: CALENDAR_ID, eventId });
+    evento = evResp.data;
+  } catch (err) {
+    return res.status(404).json({ error: 'Agendamento não encontrado' });
+  }
+
+  const privateAtual = evento.extendedProperties?.private || {};
+  if (privateAtual.telefone !== telefoneLimpo) {
+    return res.status(403).json({ error: 'Este agendamento não pertence a esse telefone' });
+  }
+
+  await calendar.events.patch({
+    calendarId: CALENDAR_ID,
+    eventId,
+    resource: {
+      extendedProperties: {
+        private: { ...privateAtual, status: 'confirmado' },
+      },
+    },
+  });
+
+  return res.status(200).json({ success: true });
+}
+
 // ---- POST ?tipo=fila-espera { nome, telefone, data, servico } ----
 // Cliente pede pra ser avisado se abrir uma vaga num dia sem horários disponíveis.
 async function entrarNaFila(req, res) {
-  const { nome, telefone, data, servico } = req.body;
+  const { nome, telefone, data, servico, barbeiro_id } = req.body;
   if (!nome || !telefone || !data) {
     return res.status(400).json({ error: 'nome, telefone e data são obrigatórios' });
   }
   const telefoneLimpo = telefone.replace(/\D/g, '');
 
   await pool.query(
-    `INSERT INTO fila_espera (nome, telefone, data, servico) VALUES ($1, $2, $3, $4)`,
-    [nome, telefoneLimpo, data, servico || null]
+    `INSERT INTO fila_espera (nome, telefone, data, servico, barbeiro_id) VALUES ($1, $2, $3, $4, $5)`,
+    [nome, telefoneLimpo, data, servico || null, barbeiro_id || null]
   );
 
   return res.status(200).json({ success: true });
@@ -347,6 +395,7 @@ module.exports = async (req, res) => {
 
     if (req.method === 'POST') {
       if (tipo === 'cancelar') return await cancelarAgendamento(req, res);
+      if (tipo === 'confirmar') return await confirmarPresenca(req, res);
       if (tipo === 'fila-espera') return await entrarNaFila(req, res);
       return await criarAgendamento(req, res);
     }
