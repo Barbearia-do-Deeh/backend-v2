@@ -18,6 +18,7 @@ const CRON_SECRET = process.env.CRON_SECRET;
 const REMINDER_HOURS = parseFloat(process.env.REMINDER_HOURS || '3');
 const INTERVAL_MINUTES = parseFloat(process.env.CRON_INTERVAL_MINUTES || '15');
 const AVALIACAO_HORAS_APOS = parseFloat(process.env.AVALIACAO_HORAS_APOS || '1');
+const CONFIRMACAO_HORAS_ANTES = parseFloat(process.env.CONFIRMACAO_HORAS_ANTES || '24');
 const REVIEW_URL = 'https://share.google/zfVJVDrPgBTdu0j6u';
 
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY;
@@ -67,6 +68,11 @@ module.exports = async (req, res) => {
   // Modo aniversário (chamado pelo cron 1x/dia — ver comentário na função)
   if (req.query.tipo === 'aniversario') {
     return enviarAniversarios(req, res);
+  }
+
+  // Modo confirmação de presença — 1 dia antes do horário (chamado pelo cron)
+  if (req.query.tipo === 'confirmacao') {
+    return enviarConfirmacoes(req, res);
   }
 
   try {
@@ -411,3 +417,93 @@ async function enviarAniversarios(req, res) {
     return res.status(500).json({ success: false, error: err.message });
   }
 }
+
+// ---- Confirmação de presença (1 dia antes) ----
+// GET /api/enviar-lembretes?tipo=confirmacao&secret=SEU_CRON_SECRET
+// Mesma lógica dos outros modos, olhando pra frente: busca agendamentos que começam
+// em ~CONFIRMACAO_HORAS_ANTES (padrão 24h) e pede pro cliente confirmar presença —
+// ele confirma pela tela "Meus agendamentos" do app (botão "Confirmar presença",
+// chama POST /api/agendar?tipo=confirmar). Dedupe via confirmacoes_enviadas.
+// Diferente do lembrete de 3h (que é só um aviso), esse é pensado pra reduzir falta:
+// dá tempo do cliente cancelar se não puder ir, em vez de simplesmente não aparecer.
+async function enviarConfirmacoes(req, res) {
+  try {
+    const agora = new Date();
+    const janelaInicio = new Date(agora.getTime() + CONFIRMACAO_HORAS_ANTES * 60 * 60 * 1000);
+    const janelaFim = new Date(janelaInicio.getTime() + (INTERVAL_MINUTES + 5) * 60 * 1000);
+
+    const auth = new google.auth.JWT({
+      email: CLIENT_EMAIL,
+      key: PRIVATE_KEY,
+      scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
+    });
+    const calendar = google.calendar({ version: 'v3', auth });
+
+    const response = await calendar.events.list({
+      calendarId: CALENDAR_ID,
+      timeMin: janelaInicio.toISOString(),
+      timeMax: janelaFim.toISOString(),
+      singleEvents: true,
+      orderBy: 'startTime',
+    });
+
+    const eventos = response.data.items || [];
+    let enviados = 0;
+    let pulados = 0;
+    const erros = [];
+
+    for (const ev of eventos) {
+      if (!ev.start?.dateTime) continue; // ignora eventos de dia inteiro (ex: bloqueios)
+
+      const jaEnviado = await pool.query(
+        'SELECT 1 FROM confirmacoes_enviadas WHERE event_id = $1',
+        [ev.id]
+      );
+      if (jaEnviado.rows.length > 0) { pulados++; continue; }
+
+      const priv = ev.extendedProperties?.private || {};
+      const telefone = priv.telefone;
+      if (!telefone) continue; // evento antigo, sem os dados estruturados
+
+      const subRow = await pool.query(
+        'SELECT subscription FROM push_subscriptions WHERE telefone = $1',
+        [telefone]
+      );
+      if (subRow.rows.length === 0) continue; // cliente não tem inscrição de push
+
+      const { nome, servico } = parseNomeServico(ev.summary);
+      const horaEvento = new Date(ev.start.dateTime).toLocaleTimeString('pt-BR', {
+        hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo',
+      });
+
+      const payload = JSON.stringify({
+        title: 'Confirma sua presença? ✂️',
+        body: `${nome ? nome + ', você tem' : 'Você tem'} ${servico || 'um horário'} amanhã às ${horaEvento}. Abra o app pra confirmar ou cancelar.`,
+        icon: '/icon-192.png',
+      });
+
+      try {
+        await webpush.sendNotification(subRow.rows[0].subscription, payload);
+        await pool.query(
+          'INSERT INTO confirmacoes_enviadas (event_id) VALUES ($1) ON CONFLICT DO NOTHING',
+          [ev.id]
+        );
+        enviados++;
+      } catch (pushErr) {
+        erros.push({ telefone, erro: pushErr.message });
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      verificados: eventos.length,
+      enviados,
+      pulados,
+      erros,
+    });
+  } catch (err) {
+    console.error('Erro ao enviar confirmações:', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+}
+
