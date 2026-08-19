@@ -114,12 +114,30 @@ async function handleBarbeiros(req, res, client) {
     return res.status(200).json({ success: true, barbeiro: atualizado.rows[0] });
   }
 
+  if (req.method === 'DELETE') {
+    const { id } = req.body || {};
+    if (!id) {
+      return res.status(400).json({ error: 'id é obrigatório' });
+    }
+    try {
+      await client.query('DELETE FROM barbeiros WHERE id = $1', [id]);
+      return res.status(200).json({ success: true });
+    } catch (err) {
+      // Provável violação de FK: já existe comanda ou fila de espera apontando pra
+      // esse barbeiro. Nesses casos é mais seguro desativar (PUT ativo=false) do que
+      // apagar de vez — a mensagem já sugere isso.
+      return res.status(409).json({
+        error: 'Não foi possível excluir — esse barbeiro já tem movimentação registrada. Marque como "Inativo" em vez de excluir.',
+      });
+    }
+  }
+
   return res.status(405).json({ error: 'Método não permitido' });
 }
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   if (req.method === 'OPTIONS') return res.status(200).end();
