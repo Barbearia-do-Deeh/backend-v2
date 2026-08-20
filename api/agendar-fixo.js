@@ -14,7 +14,7 @@ module.exports = async (req, res) => {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Método não permitido' });
 
   try {
-    const { nome, telefone, servico, dataInicio, horario, duracao, preco, repeticoes, barbeiro_id } = req.body;
+    const { nome, telefone, servico, dataInicio, horario, duracao, preco, repeticoes, barbeiro_id, intervaloSemanas } = req.body;
 
     if (!nome || !telefone || !servico || !dataInicio || !horario) {
       return res.status(400).json({ error: 'Dados incompletos' });
@@ -37,14 +37,17 @@ module.exports = async (req, res) => {
     const toISO = (d) => d.toISOString().replace('Z', '-03:00').slice(0, 19) + '-03:00';
 
     const count = parseInt(repeticoes, 10) || 12;
+    // 1 = toda semana (padrão), 2 = a cada 14 dias, 3 = a cada 21 dias, etc.
+    const intervalo = parseInt(intervaloSemanas, 10) || 1;
+    const labelRecorrencia = intervalo === 1 ? 'Horário fixo semanal' : `Horário fixo (a cada ${intervalo * 7} dias)`;
 
     const event = {
       summary: `✂️ ${servico} — ${nome} (fixo)`,
-      description: `📱 WhatsApp: ${telefone}\n💈 Serviço: ${servico}\n💰 Valor: ${preco || 'incluso no pacote'}\n⏱ Duração: ${duracao || '60 min'}\n🔁 Horário fixo semanal`,
+      description: `📱 WhatsApp: ${telefone}\n💈 Serviço: ${servico}\n💰 Valor: ${preco || 'incluso no pacote'}\n⏱ Duração: ${duracao || '60 min'}\n🔁 ${labelRecorrencia}`,
       location: ENDERECO,
       start: { dateTime: toISO(startUTC), timeZone: 'America/Sao_Paulo' },
       end: { dateTime: toISO(endUTC), timeZone: 'America/Sao_Paulo' },
-      recurrence: [`RRULE:FREQ=WEEKLY;COUNT=${count}`],
+      recurrence: [`RRULE:FREQ=WEEKLY;INTERVAL=${intervalo};COUNT=${count}`],
       colorId: '5',
       reminders: {
         useDefault: false,
