@@ -10,7 +10,7 @@ module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Método não permitido' });
   try {
-    const { data, horaInicio, horaFim, motivo, barbeiro_id } = req.body;
+    const { data, horaInicio, horaFim, motivo, barbeiro_id, repetirSemanas } = req.body;
     if (!data || !horaInicio || !horaFim) {
       return res.status(400).json({ error: 'Dados incompletos' });
     }
@@ -26,6 +26,7 @@ module.exports = async (req, res) => {
     const startUTC = new Date(Date.UTC(ano, mes - 1, dia, h1, m1));
     const endUTC = new Date(Date.UTC(ano, mes - 1, dia, h2, m2));
     const toISO = (d) => d.toISOString().replace('Z', '-03:00').slice(0, 19) + '-03:00';
+    const count = parseInt(repetirSemanas, 10) || 0;
     const event = {
       // Sem barbeiro_id, o bloqueio vale pra barbearia toda (mesmo comportamento de
       // sempre). Com barbeiro_id, disponibilidade.js só trava a agenda desse barbeiro
@@ -34,6 +35,10 @@ module.exports = async (req, res) => {
       start: { dateTime: toISO(startUTC), timeZone: 'America/Sao_Paulo' },
       end: { dateTime: toISO(endUTC), timeZone: 'America/Sao_Paulo' },
       colorId: '8',
+      // Bloqueio recorrente (ex: todo sábado à tarde fechado por padrão). Pra "abrir"
+      // uma data específica depois, é só apagar aquela ocorrência direto no Google
+      // Calendar ("apagar somente este evento") — não precisa mexer no app.
+      ...(count > 1 ? { recurrence: [`RRULE:FREQ=WEEKLY;COUNT=${count}`] } : {}),
       ...(barbeiro_id ? { extendedProperties: { private: { barbeiro_id: String(barbeiro_id) } } } : {}),
     };
     const response = await calendar.events.insert({
