@@ -308,10 +308,14 @@ async function criarAgendamento(req, res) {
       });
     }
   } catch (err) {
-    // Se a checagem em si falhar (ex: instabilidade da API do Google), segue com o
-    // agendamento em vez de travar o cliente por um problema à parte — melhor um
-    // conflito raro do que ninguém conseguir agendar.
-    console.error('Erro na checagem final de conflito (seguindo mesmo assim):', err.message);
+    // Diferente de disponibilidade.js (onde falha aberta é aceitável — só afeta o
+    // que É MOSTRADO), aqui é a checagem que decide se GRAVA o agendamento. Falhar
+    // aberto aqui reabriria exatamente a brecha que essa checagem existe pra fechar.
+    // Prefere recusar e pedir pra tentar de novo a arriscar uma reserva dupla.
+    console.error('Erro na checagem final de conflito:', err.message);
+    return res.status(503).json({
+      error: 'Não foi possível confirmar a disponibilidade agora. Tente novamente em instantes.',
+    });
   }
 
   const event = {
