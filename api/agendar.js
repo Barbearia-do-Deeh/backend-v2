@@ -278,6 +278,42 @@ async function criarAgendamento(req, res) {
   }
   const resumoBarbeiro = nomeBarbeiro ? `\n✂️ Profissional: ${nomeBarbeiro}` : '';
 
+  // ---- Checagem final de conflito, na hora H ----
+  // O cliente pode ter ficado minutos na tela (escolhendo produto, digitando nome)
+  // desde que viu o horário livre em /api/disponibilidade. Nesse intervalo, outro
+  // agendamento — ou um compromisso seu criado direto no Calendar — pode ter ocupado
+  // esse mesmo horário. Sem essa checagem aqui, o evento seria criado por cima de
+  // qualquer jeito (dois agendamentos sobrepostos na mesma agenda).
+  try {
+    const dataISO = `${ano}-${String(mes).padStart(2, '0')}-${String(dia).padStart(2, '0')}`;
+    const diaResp = await calendar.events.list({
+      calendarId: CALENDAR_ID,
+      timeMin: `${dataISO}T00:00:00-03:00`,
+      timeMax: `${dataISO}T23:59:59-03:00`,
+      singleEvents: true,
+    });
+    const eventosDoDia = diaResp.data.items || [];
+    const conflito = eventosDoDia.some((ev) => {
+      if (!ev.start?.dateTime || !ev.end?.dateTime) return false;
+      const barbeiroDoEvento = ev.extendedProperties?.private?.barbeiro_id;
+      // Evento de outro barbeiro específico não conflita com esse agendamento
+      if (barbeiro_id && barbeiroDoEvento && barbeiroDoEvento !== String(barbeiro_id)) return false;
+      const evInicio = new Date(ev.start.dateTime).getTime();
+      const evFim = new Date(ev.end.dateTime).getTime();
+      return startUTC.getTime() < evFim && endUTC.getTime() > evInicio;
+    });
+    if (conflito) {
+      return res.status(409).json({
+        error: 'Esse horário acabou de ficar indisponível. Volte e escolha outro horário.',
+      });
+    }
+  } catch (err) {
+    // Se a checagem em si falhar (ex: instabilidade da API do Google), segue com o
+    // agendamento em vez de travar o cliente por um problema à parte — melhor um
+    // conflito raro do que ninguém conseguir agendar.
+    console.error('Erro na checagem final de conflito (seguindo mesmo assim):', err.message);
+  }
+
   const event = {
     summary: `✂️ ${servico} — ${nome}`,
     description: `📱 WhatsApp: ${telefone}\n💈 Serviço: ${servico}\n💰 Valor: ${preco}\n⏱ Duração: ${duracao || '60 min'}${resumoBarbeiro}${resumoProdutos}`,
