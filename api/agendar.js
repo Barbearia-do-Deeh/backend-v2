@@ -14,6 +14,40 @@ const ADMIN_TELEFONE = WHATSAPP_ADMIN; // mesmo identificador usado no admin.htm
 
 webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 
+// ---- Horário de funcionamento (fonte da verdade no SERVIDOR — não depende do front) ----
+// Domingo(0) e segunda(1): fechado. Demais dias: faixa abre/fecha em minutos desde 00:00.
+const DIAS_FECHADOS = [0, 1];
+const HORARIO_POR_DIA = {
+  2: { abre: '09:00', fecha: '19:00' }, // terça
+  3: { abre: '09:00', fecha: '19:00' }, // quarta
+  4: { abre: '09:00', fecha: '19:00' }, // quinta
+  5: { abre: '09:00', fecha: '19:00' }, // sexta
+  6: { abre: '08:00', fecha: '17:00' }, // sábado
+};
+
+function minutosDoDia(hhmm) {
+  const [h, m] = hhmm.split(':').map(Number);
+  return h * 60 + m;
+}
+
+// Retorna null se o dia/horário está dentro do funcionamento, ou uma mensagem de erro.
+function validarHorarioFuncionamento(ano, mes, dia, horario, duracaoMin) {
+  const diaSemana = new Date(Date.UTC(ano, mes - 1, dia)).getUTCDay();
+  if (DIAS_FECHADOS.includes(diaSemana)) {
+    return 'A barbearia não abre nesse dia.';
+  }
+  const janela = HORARIO_POR_DIA[diaSemana];
+  if (!janela) {
+    return 'A barbearia não abre nesse dia.';
+  }
+  const inicioMin = minutosDoDia(horario);
+  const fimMin = inicioMin + duracaoMin;
+  if (inicioMin < minutosDoDia(janela.abre) || fimMin > minutosDoDia(janela.fecha)) {
+    return `Horário fora do funcionamento (${janela.abre} às ${janela.fecha} nesse dia).`;
+  }
+  return null;
+}
+
 function addDias(data, dias) {
   const d = new Date(data);
   d.setDate(d.getDate() + dias);
@@ -30,9 +64,6 @@ function getCalendarClient() {
 }
 
 // ---- GET ?tipo=meus-agendamentos&telefone=... ----
-// Lista os próximos 30 dias de agendamentos daquele telefone, usando
-// extendedProperties.private.telefone (gravado na criação do evento) pra filtrar
-// com precisão — não depende de parsear texto da description.
 async function listarMeusAgendamentos(req, res) {
   const { telefone } = req.query;
   if (!telefone) {
@@ -72,10 +103,6 @@ async function listarMeusAgendamentos(req, res) {
   return res.status(200).json({ success: true, agendamentos });
 }
 
-// ---- Fila de espera: avisa quem estava esperando vaga nesse dia (best-effort) ----
-// Só marca como notificado quando o push realmente é enviado com sucesso — se o
-// cliente ainda não tiver se inscrito em push_subscriptions, fica pendente e tenta
-// de novo no próximo cancelamento daquele dia (sem custo real, é só um SELECT vazio).
 function extrairDataDDMMAAAA(evento) {
   const startStr = evento.start?.dateTime || evento.start?.date || '';
   const dataPart = startStr.split('T')[0];
@@ -88,12 +115,8 @@ async function notificarFilaEspera(evento) {
   const dataStr = extrairDataDDMMAAAA(evento);
   if (!dataStr) return;
 
-  // Barbeiro do horário que abriu (pode ser null se o evento não tinha marcado).
   const barbeiroDoEvento = evento.extendedProperties?.private?.barbeiro_id || null;
 
-  // Só avisa quem estava esperando ESSE barbeiro específico, ou quem entrou na fila
-  // sem se importar com qual barbeiro (barbeiro_id nulo — inclui todo mundo que
-  // entrou na fila antes dessa funcionalidade existir).
   const filaResult = await pool.query(
     `SELECT id, telefone, nome, servico FROM fila_espera
      WHERE data = $1 AND notificado = false
@@ -108,7 +131,7 @@ async function notificarFilaEspera(evento) {
         'SELECT subscription FROM push_subscriptions WHERE telefone = $1',
         [item.telefone]
       );
-      if (subRow.rows.length === 0) continue; // ainda sem inscrição push, tenta de novo depois
+      if (subRow.rows.length === 0) continue;
 
       const payload = JSON.stringify({
         title: 'Vaga aberta! ✂️',
@@ -124,7 +147,6 @@ async function notificarFilaEspera(evento) {
 }
 
 // ---- POST ?tipo=cancelar { eventId, telefone } ----
-// Confirma que o telefone bate com o dono do evento antes de apagar do Calendar.
 async function cancelarAgendamento(req, res) {
   const { eventId, telefone } = req.body;
   if (!eventId || !telefone) {
@@ -149,7 +171,6 @@ async function cancelarAgendamento(req, res) {
 
   await calendar.events.delete({ calendarId: CALENDAR_ID, eventId });
 
-  // Best-effort: não derruba a resposta do cancelamento se a notificação da fila falhar.
   try {
     await notificarFilaEspera(evento);
   } catch (err) {
@@ -160,9 +181,6 @@ async function cancelarAgendamento(req, res) {
 }
 
 // ---- POST ?tipo=confirmar { eventId, telefone } ----
-// Cliente confirma presença a partir do push enviado ~1 dia antes (ver
-// enviarConfirmacoes em enviar-lembretes.js). Mesma verificação de dono do
-// cancelarAgendamento — só que aqui só atualiza o status, não apaga nada.
 async function confirmarPresenca(req, res) {
   const { eventId, telefone } = req.body;
   if (!eventId || !telefone) {
@@ -199,7 +217,6 @@ async function confirmarPresenca(req, res) {
 }
 
 // ---- POST ?tipo=fila-espera { nome, telefone, data, servico } ----
-// Cliente pede pra ser avisado se abrir uma vaga num dia sem horários disponíveis.
 async function entrarNaFila(req, res) {
   const { nome, telefone, data, servico, barbeiro_id } = req.body;
   if (!nome || !telefone || !data) {
@@ -226,24 +243,26 @@ async function criarAgendamento(req, res) {
 
   const calendar = getCalendarClient();
 
-  // Montar data/hora do evento
-  // CORREÇÃO: usamos Date.UTC para "fixar" o horário informado (11:00, por exemplo)
-  // independente do fuso horário em que o servidor da Vercel está rodando.
-  // Sem isso, o servidor (que roda em UTC) interpretava 11:00 como UTC e o evento
-  // acabava sendo criado 3 horas adiantado/atrasado no Google Calendar.
   const [dia, mes, ano] = data.split('/');
   const [hora, minuto] = horario.split(':');
-  const startUTC = new Date(Date.UTC(ano, mes - 1, dia, hora, minuto));
   const duracaoMin = duracao === '15 min' ? 15 : 60;
+
+  // ---- Validação de dia/horário de funcionamento — TRAVA NO SERVIDOR ----
+  // Antes essa regra só existia no front-end (index.html). Se o front tivesse
+  // qualquer brecha (bug de fuso, cache antigo, tela de horário fixo etc.), o
+  // back-end aceitava o agendamento numa boa — foi o que deixou passar
+  // agendamento em dia fechado (terça-feira). Agora o servidor recusa sempre,
+  // não importa o que o front mandar.
+  const erroHorario = validarHorarioFuncionamento(ano, mes, dia, horario, duracaoMin);
+  if (erroHorario) {
+    return res.status(400).json({ error: erroHorario });
+  }
+
+  const startUTC = new Date(Date.UTC(ano, mes - 1, dia, hora, minuto));
   const endUTC = new Date(startUTC.getTime() + duracaoMin * 60000);
 
-  // Como startUTC/endUTC foram criados com Date.UTC usando os números exatos
-  // que o cliente escolheu, o toISOString() devolve esses mesmos números com "Z".
-  // Trocamos o "Z" por "-03:00" para declarar corretamente que esse horário
-  // já está no fuso de São Paulo (sem depender do fuso do servidor).
   const toISO = (d) => d.toISOString().replace('Z', '-03:00').slice(0, 19) + '-03:00';
 
-  // ---- Produtos: valida contra o catálogo e monta o resumo da comanda ----
   let itensProduto = [];
   let valorProdutos = 0;
   if (Array.isArray(produtos) && produtos.length > 0) {
@@ -266,7 +285,6 @@ async function criarAgendamento(req, res) {
     ? `\n🛍 Produtos: ${itensProduto.map(i => `${i.nome} x${i.quantidade}`).join(', ')} (R$ ${valorProdutos.toFixed(2).replace('.', ',')} — pago na hora)`
     : '';
 
-  // ---- Nome do barbeiro (só pra description do evento — o filtro real usa barbeiro_id) ----
   let nomeBarbeiro = '';
   if (barbeiro_id) {
     try {
@@ -279,11 +297,10 @@ async function criarAgendamento(req, res) {
   const resumoBarbeiro = nomeBarbeiro ? `\n✂️ Profissional: ${nomeBarbeiro}` : '';
 
   // ---- Checagem final de conflito, na hora H ----
-  // O cliente pode ter ficado minutos na tela (escolhendo produto, digitando nome)
-  // desde que viu o horário livre em /api/disponibilidade. Nesse intervalo, outro
-  // agendamento — ou um compromisso seu criado direto no Calendar — pode ter ocupado
-  // esse mesmo horário. Sem essa checagem aqui, o evento seria criado por cima de
-  // qualquer jeito (dois agendamentos sobrepostos na mesma agenda).
+  // CORREÇÃO: eventos de "dia inteiro" (sem dateTime, só "date" — ex: compromisso
+  // pessoal criado direto no Calendar sem marcar hora) antes eram IGNORADOS aqui
+  // (`if (!ev.start?.dateTime...) return false`), então o sistema agendava por
+  // cima deles sem perceber. Agora um evento de dia inteiro bloqueia o dia todo.
   try {
     const dataISO = `${ano}-${String(mes).padStart(2, '0')}-${String(dia).padStart(2, '0')}`;
     const diaResp = await calendar.events.list({
@@ -294,10 +311,14 @@ async function criarAgendamento(req, res) {
     });
     const eventosDoDia = diaResp.data.items || [];
     const conflito = eventosDoDia.some((ev) => {
-      if (!ev.start?.dateTime || !ev.end?.dateTime) return false;
       const barbeiroDoEvento = ev.extendedProperties?.private?.barbeiro_id;
-      // Evento de outro barbeiro específico não conflita com esse agendamento
       if (barbeiro_id && barbeiroDoEvento && barbeiroDoEvento !== String(barbeiro_id)) return false;
+
+      // Evento de dia inteiro (sem horário específico) bloqueia o dia todo.
+      if (!ev.start?.dateTime || !ev.end?.dateTime) {
+        return !!(ev.start?.date || ev.end?.date);
+      }
+
       const evInicio = new Date(ev.start.dateTime).getTime();
       const evFim = new Date(ev.end.dateTime).getTime();
       return startUTC.getTime() < evFim && endUTC.getTime() > evInicio;
@@ -308,10 +329,6 @@ async function criarAgendamento(req, res) {
       });
     }
   } catch (err) {
-    // Diferente de disponibilidade.js (onde falha aberta é aceitável — só afeta o
-    // que É MOSTRADO), aqui é a checagem que decide se GRAVA o agendamento. Falhar
-    // aberto aqui reabriria exatamente a brecha que essa checagem existe pra fechar.
-    // Prefere recusar e pedir pra tentar de novo a arriscar uma reserva dupla.
     console.error('Erro na checagem final de conflito:', err.message);
     return res.status(503).json({
       error: 'Não foi possível confirmar a disponibilidade agora. Tente novamente em instantes.',
@@ -332,8 +349,6 @@ async function criarAgendamento(req, res) {
         { method: 'popup', minutes: 15 },
       ],
     },
-    // Dados estruturados pra buscar/filtrar depois (ex: "Meus agendamentos" do cliente)
-    // sem depender de parsear texto da description.
     extendedProperties: {
       private: {
         telefone: telefoneLimpo,
@@ -349,8 +364,6 @@ async function criarAgendamento(req, res) {
     resource: event,
   });
 
-  // ---- Notifica o Deeh na hora (não espera o Google Calendar sincronizar) ----
-  // Best-effort: se não tiver inscrição push ainda ou der erro, não derruba o agendamento.
   try {
     const subRow = await pool.query(
       'SELECT subscription FROM push_subscriptions WHERE telefone = $1',
@@ -369,9 +382,6 @@ async function criarAgendamento(req, res) {
     console.error('Erro ao enviar push de novo agendamento:', err.message);
   }
 
-  // ---- Garante que o cliente exista na tabela clientes (pra aparecer no admin) ----
-  // Best-effort: se der erro aqui, não derruba o agendamento (o evento já foi criado).
-  // Não mexe em plano/saldo de quem já existe — só atualiza o nome.
   try {
     const hoje = new Date().toISOString().slice(0, 10);
     const fim = addDias(hoje, 30);
@@ -393,7 +403,6 @@ async function criarAgendamento(req, res) {
     console.error('Erro ao gravar cliente:', err.message);
   }
 
-  // ---- Grava a comanda de produtos no Neon (best-effort: não derruba o agendamento) ----
   let comandaId = null;
   if (itensProduto.length > 0) {
     try {
