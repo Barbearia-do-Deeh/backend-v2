@@ -26,8 +26,14 @@ const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
 const CALENDAR_ID = process.env.CALENDAR_ID || CALENDAR_ID_PADRAO;
 
-// Dias da semana com atendimento (0=domingo ... 6=sábado). Fechado: domingo(0) e segunda(1).
-const DIAS_FECHADOS = [0, 1];
+// Dias da semana com atendimento (0=domingo ... 6=sábado). Fechado: domingo(0), segunda(1) e terça(2).
+const DIAS_FECHADOS = [0, 1, 2];
+
+// Aniversário sincronizado do Google Contacts vem como evento com eventType 'birthday'
+// (e não deve bloquear horário — é só um lembrete, não um compromisso).
+function ehAniversario(ev) {
+  return ev.eventType === 'birthday';
+}
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -81,6 +87,7 @@ module.exports = async (req, res) => {
     };
 
     const ocupados = eventos
+      .filter((ev) => !ehAniversario(ev))
       .filter(passaFiltroBarbeiro)
       .map((ev) => {
         // Evento de dia inteiro (sem dateTime, só "date") bloqueia o dia todo.
