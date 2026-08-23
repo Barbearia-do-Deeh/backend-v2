@@ -15,15 +15,20 @@ const ADMIN_TELEFONE = WHATSAPP_ADMIN; // mesmo identificador usado no admin.htm
 webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
 
 // ---- Horário de funcionamento (fonte da verdade no SERVIDOR — não depende do front) ----
-// Domingo(0) e segunda(1): fechado. Demais dias: faixa abre/fecha em minutos desde 00:00.
-const DIAS_FECHADOS = [0, 1];
+// Domingo(0), segunda(1) e terça(2): fechado. Demais dias: faixa abre/fecha em minutos desde 00:00.
+const DIAS_FECHADOS = [0, 1, 2];
 const HORARIO_POR_DIA = {
-  2: { abre: '09:00', fecha: '19:00' }, // terça
   3: { abre: '09:00', fecha: '19:00' }, // quarta
   4: { abre: '09:00', fecha: '19:00' }, // quinta
   5: { abre: '09:00', fecha: '19:00' }, // sexta
   6: { abre: '08:00', fecha: '17:00' }, // sábado
 };
+
+// Aniversário sincronizado do Google Contacts vem como evento com eventType 'birthday'
+// (e não deve bloquear horário — é só um lembrete, não um compromisso).
+function ehAniversario(ev) {
+  return ev.eventType === 'birthday';
+}
 
 function minutosDoDia(hhmm) {
   const [h, m] = hhmm.split(':').map(Number);
@@ -311,6 +316,7 @@ async function criarAgendamento(req, res) {
     });
     const eventosDoDia = diaResp.data.items || [];
     const conflito = eventosDoDia.some((ev) => {
+      if (ehAniversario(ev)) return false;
       const barbeiroDoEvento = ev.extendedProperties?.private?.barbeiro_id;
       if (barbeiro_id && barbeiroDoEvento && barbeiroDoEvento !== String(barbeiro_id)) return false;
 
