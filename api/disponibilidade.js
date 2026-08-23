@@ -101,11 +101,20 @@ module.exports = async (req, res) => {
             minute: '2-digit',
             timeZone: 'America/Sao_Paulo',
           }),
-          fim: new Date(ev.end.dateTime).toLocaleTimeString('pt-BR', {
-            hour: '2-digit',
-            minute: '2-digit',
-            timeZone: 'America/Sao_Paulo',
-          }),
+          // Evento que termina exatamente à meia-noite devolve "00:00" do
+          // toLocaleTimeString — mas o front-end (index.html) faz `hf*60+mf`
+          // pra comparar, e "00:00" vira 0 (início do dia), não 1440 (fim do
+          // dia). Isso invertia o período de ocupação e fazia o app mostrar
+          // como livre um horário que na verdade estava dentro do bloqueio.
+          // "23:59" representa a mesma coisa na prática e não quebra essa conta.
+          fim: (() => {
+            const fimStr = new Date(ev.end.dateTime).toLocaleTimeString('pt-BR', {
+              hour: '2-digit',
+              minute: '2-digit',
+              timeZone: 'America/Sao_Paulo',
+            });
+            return fimStr === '00:00' ? '23:59' : fimStr;
+          })(),
         };
       })
       .filter(Boolean);
