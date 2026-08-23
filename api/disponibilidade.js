@@ -95,27 +95,36 @@ module.exports = async (req, res) => {
           if (!ev.start?.date && !ev.end?.date) return null; // nem dateTime nem date, ignora
           return { inicio: '00:00', fim: '23:59' };
         }
-        return {
-          inicio: new Date(ev.start.dateTime).toLocaleTimeString('pt-BR', {
-            hour: '2-digit',
-            minute: '2-digit',
-            timeZone: 'America/Sao_Paulo',
-          }),
-          // Evento que termina exatamente à meia-noite devolve "00:00" do
-          // toLocaleTimeString — mas o front-end (index.html) faz `hf*60+mf`
-          // pra comparar, e "00:00" vira 0 (início do dia), não 1440 (fim do
-          // dia). Isso invertia o período de ocupação e fazia o app mostrar
-          // como livre um horário que na verdade estava dentro do bloqueio.
-          // "23:59" representa a mesma coisa na prática e não quebra essa conta.
-          fim: (() => {
-            const fimStr = new Date(ev.end.dateTime).toLocaleTimeString('pt-BR', {
+
+        // CORREÇÃO: comparar a DATA real do evento (não só o horário) com o dia
+        // consultado. Um evento que começou ONTEM (ainda em andamento hoje de
+        // madrugada) ou que só termina AMANHÃ (vira a noite) tem start/end com
+        // horário que, sozinho, não representa "o dia todo" — ex: um bloqueio
+        // de 26/08 12:00 até 27/08 09:00 devolve fim "09:00", e 09:00 é NUMERICAMENTE
+        // menor que 12:00, invertendo o período pro front-end (mesmo problema que
+        // o de "00:00", só que sem bater exatamente na meia-noite). Solução: se o
+        // evento termina num dia DEPOIS do consultado, trata como indo até 23:59
+        // desse dia; se começou num dia ANTES, trata como tendo começado 00:00.
+        const diaEventoInicio = new Date(ev.start.dateTime).toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+        const diaEventoFim = new Date(ev.end.dateTime).toLocaleDateString('en-CA', { timeZone: 'America/Sao_Paulo' });
+
+        const inicio = diaEventoInicio < dataISO
+          ? '00:00'
+          : new Date(ev.start.dateTime).toLocaleTimeString('pt-BR', {
               hour: '2-digit',
               minute: '2-digit',
               timeZone: 'America/Sao_Paulo',
             });
-            return fimStr === '00:00' ? '23:59' : fimStr;
-          })(),
-        };
+
+        const fim = diaEventoFim > dataISO
+          ? '23:59'
+          : new Date(ev.end.dateTime).toLocaleTimeString('pt-BR', {
+              hour: '2-digit',
+              minute: '2-digit',
+              timeZone: 'America/Sao_Paulo',
+            });
+
+        return { inicio, fim };
       })
       .filter(Boolean);
 
