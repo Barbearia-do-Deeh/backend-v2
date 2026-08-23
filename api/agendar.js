@@ -266,6 +266,20 @@ async function criarAgendamento(req, res) {
   const startUTC = new Date(Date.UTC(ano, mes - 1, dia, hora, minuto));
   const endUTC = new Date(startUTC.getTime() + duracaoMin * 60000);
 
+  // ---- Correção de fuso pra comparação de conflito ----
+  // startUTC/endUTC acima tratam "13:00" como se já fosse UTC (é um truque só
+  // pra montar a STRING enviada ao Google com toISO(), que troca o "Z" por
+  // "-03:00" — isso sim fica correto). Só que pra COMPARAR contra os horários
+  // reais dos eventos existentes (que o Google já devolve no fuso certo,
+  // portanto 3h à frente desse valor "cru"), precisa somar as 3h de volta.
+  // Sem isso, a checagem de conflito compara como se o cliente tivesse
+  // escolhido um horário 3h mais cedo do que realmente escolheu — foi isso
+  // que deixava agendar por cima de compromissos que começavam mais tarde
+  // no dia (o sistema achava que ainda não tinha chegado no horário deles).
+  const FUSO_SP_MS = 3 * 60 * 60 * 1000;
+  const startReal = startUTC.getTime() + FUSO_SP_MS;
+  const endReal = endUTC.getTime() + FUSO_SP_MS;
+
   const toISO = (d) => d.toISOString().replace('Z', '-03:00').slice(0, 19) + '-03:00';
 
   let itensProduto = [];
@@ -327,7 +341,7 @@ async function criarAgendamento(req, res) {
 
       const evInicio = new Date(ev.start.dateTime).getTime();
       const evFim = new Date(ev.end.dateTime).getTime();
-      return startUTC.getTime() < evFim && endUTC.getTime() > evInicio;
+      return startReal < evFim && endReal > evInicio;
     });
     if (conflito) {
       return res.status(409).json({
