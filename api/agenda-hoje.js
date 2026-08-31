@@ -116,7 +116,7 @@ function calcularCoberturaEAvulso(servicoStr, pacoteUsadoStr) {
 // vira 'compareceu'; remove o registro se sair de 'compareceu' pra qualquer
 // outro status. Best-effort: erro aqui não derruba a resposta de marcar-presença
 // (o status no Calendar já foi salvo, que é a ação principal) — só loga.
-async function sincronizarAtendimento(evento, status) {
+async function sincronizarAtendimento(evento, status, metodoPagamento) {
   const priv = evento.extendedProperties?.private || {};
   const eventId = evento.id;
 
@@ -164,19 +164,21 @@ async function sincronizarAtendimento(evento, status) {
   const insertResult = await pool.query(
     `INSERT INTO atendimentos
        (cliente_id, event_id, data_hora, servicos, forma_pagamento, valor_cobrado,
-        valor_produtos, produtos_consumidos, barbeiro_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        valor_produtos, produtos_consumidos, barbeiro_id, metodo_pagamento)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      ON CONFLICT (event_id) DO UPDATE SET
        servicos = EXCLUDED.servicos,
        forma_pagamento = EXCLUDED.forma_pagamento,
        valor_cobrado = EXCLUDED.valor_cobrado,
        valor_produtos = EXCLUDED.valor_produtos,
        produtos_consumidos = EXCLUDED.produtos_consumidos,
-       barbeiro_id = EXCLUDED.barbeiro_id
+       barbeiro_id = EXCLUDED.barbeiro_id,
+       metodo_pagamento = COALESCE(EXCLUDED.metodo_pagamento, atendimentos.metodo_pagamento)
      RETURNING id`,
     [
       clienteId, eventId, dataHora, JSON.stringify([...cobertos, ...avulsos]),
       formaPagamento, valorCobrado, valorProdutos, produtosConsumidos, barbeiroId,
+      metodoPagamento || null,
     ]
   );
 
@@ -259,7 +261,7 @@ async function listarAgenda(req, res) {
 }
 
 async function marcarPresenca(req, res) {
-  const { eventId, status } = req.body || {};
+  const { eventId, status, metodo_pagamento } = req.body || {};
   if (!eventId || !['compareceu', 'faltou', 'pendente'].includes(status)) {
     return res.status(400).json({ error: 'eventId e status (compareceu|faltou|pendente) são obrigatórios' });
   }
@@ -313,7 +315,7 @@ async function marcarPresenca(req, res) {
   // (o status já foi salvo no Calendar, que é a ação que o admin pediu).
   let avisoFinanceiro = null;
   try {
-    await sincronizarAtendimento({ ...evento, extendedProperties: { private: novoPrivate } }, status);
+    await sincronizarAtendimento({ ...evento, extendedProperties: { private: novoPrivate } }, status, metodo_pagamento);
   } catch (err) {
     console.error('Erro ao sincronizar atendimento financeiro:', err.message);
     avisoFinanceiro = 'Status salvo, mas houve um erro ao atualizar o financeiro: ' + err.message;
