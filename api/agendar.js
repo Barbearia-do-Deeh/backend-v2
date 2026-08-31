@@ -2,6 +2,8 @@ const { google } = require('googleapis');
 const webpush = require('web-push');
 const pool = require('../lib/db');
 const { ENDERECO, WHATSAPP_ADMIN, CALENDAR_ID_PADRAO, VAPID_SUBJECT_PADRAO } = require('../lib/config-negocio');
+const { saldoInicial, campoSaldo } = require('../lib/pacotes');
+const { VALOR_PLANO } = require('../lib/financas');
 
 const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
@@ -13,6 +15,61 @@ const VAPID_SUBJECT = process.env.VAPID_SUBJECT || VAPID_SUBJECT_PADRAO;
 const ADMIN_TELEFONE = WHATSAPP_ADMIN; // mesmo identificador usado no admin.html pra se inscrever
 
 webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
+
+// ---- Pacote: saldo é descontado JÁ NO AGENDAMENTO (não espera "Compareceu") ----
+// Se depois o cliente faltar ou cancelar, o crédito volta — ver devolverSaldoPacote()
+// aqui, e a mesma lógica espelhada em api/agenda-hoje.js (marcarPresenca).
+
+// Normaliza os nomes de serviço do app do cliente (ex: "Corte + Barba") pros
+// identificadores internos que lib/pacotes.js espera. "Corte Kids" nunca é
+// coberto por pacote — sempre avulso, com preço próprio.
+function servicosParaChaves(servicoStr) {
+  const MAPA = { Corte: 'corte', Barba: 'barba', Pezinho: 'pezinho', Sobrancelha: 'sobrancelha' };
+  return (servicoStr || '').split(' + ').map(s => MAPA[s.trim()] || null);
+}
+
+// Devolve pro saldo_ciclo o que tinha sido descontado num agendamento (falta
+// ou cancelamento). `privateAtual` é o extendedProperties.private do evento —
+// precisa ter `pacote_usado` (JSON gravado no momento do agendamento) e
+// `telefone`. Idempotente: não desconta duas vezes o mesmo pacote_usado,
+// desde que o chamador marque pacote_estornado depois de chamar essa função
+// (agenda-hoje.js faz isso; cancelamento não precisa, porque o evento é apagado).
+async function devolverSaldoPacote(privateAtual) {
+  if (!privateAtual?.pacote_usado || privateAtual.pacote_estornado === 'true') return;
+  const usado = JSON.parse(privateAtual.pacote_usado);
+  const telefoneLimpo = privateAtual.telefone;
+  if (!telefoneLimpo) return;
+
+  const dbClient = await pool.connect();
+  try {
+    await dbClient.query('BEGIN');
+    const result = await dbClient.query(`SELECT id FROM clientes WHERE telefone = $1 FOR UPDATE`, [telefoneLimpo]);
+    if (result.rows.length === 0) { await dbClient.query('ROLLBACK'); return; }
+    const clienteId = result.rows[0].id;
+
+    const setClauses = [];
+    const values = [clienteId];
+    let i = 2;
+    for (const [campo, qtd] of Object.entries(usado)) {
+      if (campo === 'sobrancelha_restante') {
+        setClauses.push(`${campo} = true`);
+      } else {
+        setClauses.push(`${campo} = ${campo} + $${i}`);
+        values.push(qtd);
+        i++;
+      }
+    }
+    if (setClauses.length > 0) {
+      await dbClient.query(`UPDATE saldo_ciclo SET ${setClauses.join(', ')} WHERE cliente_id = $1`, values);
+    }
+    await dbClient.query('COMMIT');
+  } catch (err) {
+    await dbClient.query('ROLLBACK');
+    throw err;
+  } finally {
+    dbClient.release();
+  }
+}
 
 // ---- Horário de funcionamento (fonte da verdade no SERVIDOR — não depende do front) ----
 // Domingo(0), segunda(1) e terça(2): fechado. Demais dias: faixa abre/fecha em minutos desde 00:00.
@@ -176,6 +233,14 @@ async function cancelarAgendamento(req, res) {
 
   await calendar.events.delete({ calendarId: CALENDAR_ID, eventId });
 
+  // Se esse agendamento tinha consumido saldo de pacote, devolve o crédito —
+  // cancelamento não deveria custar o crédito do cliente, igual à falta.
+  try {
+    await devolverSaldoPacote(evento.extendedProperties?.private || {});
+  } catch (err) {
+    console.error('Erro ao devolver saldo de pacote no cancelamento:', err.message);
+  }
+
   try {
     await notificarFilaEspera(evento);
   } catch (err) {
@@ -304,6 +369,88 @@ async function criarAgendamento(req, res) {
     ? `\n🛍 Produtos: ${itensProduto.map(i => `${i.nome} x${i.quantidade}`).join(', ')} (R$ ${valorProdutos.toFixed(2).replace('.', ',')} — pago na hora)`
     : '';
 
+  // ---- Pacote: desconta saldo AGORA, no agendamento (Opção B) ----
+  // Só mexe em quem já tem plano ativo — cliente sem plano segue igual a
+  // sempre foi (cobrança avulsa normal, sem passar por nada disso).
+  const chavesServico = servicosParaChaves(servico); // ex: ['corte','barba']; 'Corte Kids' vira null
+  const pacoteUsado = {};       // o que foi de fato descontado agora (pra devolver depois, se faltar/cancelar)
+  let avisoNovoPacote = null;   // preenchido quando algum serviço pedido já estourou o saldo do ciclo atual
+
+  const dbClientPacote = await pool.connect();
+  try {
+    await dbClientPacote.query('BEGIN');
+
+    const clienteResult = await dbClientPacote.query(
+      `SELECT c.id, c.plano, c.subtipo_essencial, c.data_fim_ciclo,
+              s.cortes_restantes, s.barbas_restantes, s.pezinhos_restantes, s.sobrancelha_restante
+       FROM clientes c LEFT JOIN saldo_ciclo s ON s.cliente_id = c.id
+       WHERE c.telefone = $1 FOR UPDATE`,
+      [telefoneLimpo]
+    );
+
+    if (clienteResult.rows.length > 0 && clienteResult.rows[0].plano && clienteResult.rows[0].plano !== 'nenhum') {
+      let cliente = clienteResult.rows[0];
+
+      // Renova o ciclo se já venceu (mesma regra usada em api/atendimentos.js)
+      const hojeStr = new Date().toISOString().slice(0, 10);
+      if (cliente.data_fim_ciclo && hojeStr > cliente.data_fim_ciclo) {
+        const novoInicio = hojeStr;
+        const novoFim = addDias(hojeStr, 30);
+        const saldoNovo = saldoInicial(cliente.plano, cliente.subtipo_essencial);
+        await dbClientPacote.query(
+          `UPDATE clientes SET data_inicio_ciclo = $1, data_fim_ciclo = $2 WHERE id = $3`,
+          [novoInicio, novoFim, cliente.id]
+        );
+        await dbClientPacote.query(
+          `UPDATE saldo_ciclo SET cortes_restantes = $1, barbas_restantes = $2,
+           pezinhos_restantes = $3, sobrancelha_restante = $4 WHERE cliente_id = $5`,
+          [saldoNovo.cortes_restantes, saldoNovo.barbas_restantes, saldoNovo.pezinhos_restantes, saldoNovo.sobrancelha_restante, cliente.id]
+        );
+        cliente = { ...cliente, ...saldoNovo, data_inicio_ciclo: novoInicio, data_fim_ciclo: novoFim };
+      }
+
+      const updates = {};
+      for (const chave of chavesServico) {
+        const campo = campoSaldo(chave);
+        if (!campo) continue; // ex: Corte Kids — nunca usa saldo de pacote
+
+        if (campo === 'sobrancelha_restante') {
+          const disponivel = updates[campo] !== undefined ? updates[campo] : cliente.sobrancelha_restante;
+          if (disponivel) {
+            updates[campo] = false;
+            pacoteUsado[campo] = true;
+          } else {
+            avisoNovoPacote = avisoNovoPacote || { plano: cliente.plano, valor: VALOR_PLANO[cliente.plano] };
+          }
+        } else {
+          const atual = updates[campo] !== undefined ? updates[campo] : cliente[campo];
+          if (atual > 0) {
+            updates[campo] = atual - 1;
+            pacoteUsado[campo] = (pacoteUsado[campo] || 0) + 1;
+          } else {
+            avisoNovoPacote = avisoNovoPacote || { plano: cliente.plano, valor: VALOR_PLANO[cliente.plano] };
+          }
+        }
+      }
+
+      const setClauses = Object.keys(updates).map((campo, i) => `${campo} = $${i + 2}`);
+      if (setClauses.length > 0) {
+        await dbClientPacote.query(
+          `UPDATE saldo_ciclo SET ${setClauses.join(', ')} WHERE cliente_id = $1`,
+          [cliente.id, ...Object.values(updates)]
+        );
+      }
+    }
+
+    await dbClientPacote.query('COMMIT');
+  } catch (err) {
+    await dbClientPacote.query('ROLLBACK');
+    console.error('Erro ao processar saldo de pacote:', err.message);
+    // Não derruba o agendamento por causa disso — segue e cobra avulso normal.
+  } finally {
+    dbClientPacote.release();
+  }
+
   let nomeBarbeiro = '';
   if (barbeiro_id) {
     try {
@@ -375,6 +522,7 @@ async function criarAgendamento(req, res) {
         servico,
         preco: preco || '',
         ...(barbeiro_id ? { barbeiro_id: String(barbeiro_id) } : {}),
+        ...(Object.keys(pacoteUsado).length ? { pacote_usado: JSON.stringify(pacoteUsado) } : {}),
       },
     },
   };
@@ -444,6 +592,7 @@ async function criarAgendamento(req, res) {
     comanda_id: comandaId,
     produtos: itensProduto,
     valor_produtos: valorProdutos,
+    aviso_pacote: avisoNovoPacote, // { plano, valor } quando algum serviço já estourou o saldo do ciclo atual
   });
 }
 
