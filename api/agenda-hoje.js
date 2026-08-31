@@ -7,9 +7,17 @@
 //
 // POST /api/agenda-hoje?tipo=marcar-presenca { eventId, status }
 // status: 'compareceu' | 'faltou' | 'pendente'. Grava no próprio evento do Calendar
-// (extendedProperties.private.status), sem precisar de tabela nova. Usado pela Agenda
-// do admin pra saber quem veio e quem faltou — e, por consequência, excluir
-// faltas do fechamento por barbeiro (ver api/financeiro.js).
+// (extendedProperties.private.status), sem precisar de tabela nova pra isso. Usado
+// pela Agenda do admin pra saber quem veio e quem faltou — e, por consequência,
+// excluir faltas do fechamento por barbeiro (ver api/financeiro.js).
+//
+// ATENDIMENTO DEFINITIVO (financeiro histórico): só quando status === 'compareceu'
+// é que o atendimento vira uma linha permanente na tabela `atendimentos` — é essa
+// tabela (não o Calendar) que alimenta api/financeiro.js e o faturamento
+// anual/semestral. Se o status sair de 'compareceu' depois (voltou pra pendente ou
+// virou falta), a linha é removida — falta/desmarcação não é faturamento.
+// Idempotente via coluna `event_id` (UNIQUE): alternar o status várias vezes não
+// duplica registro.
 //
 // Se o agendamento tinha descontado saldo de pacote (ver criarAgendamento em
 // api/agendar.js — o desconto acontece JÁ no agendamento, não espera "Compareceu"),
@@ -18,6 +26,7 @@
 const { google } = require('googleapis');
 const pool = require('../lib/db');
 const { CALENDAR_ID_PADRAO } = require('../lib/config-negocio');
+const { campoSaldo, normalizarServicos, precoAvulso } = require('../lib/pacotes');
 const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
 const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
 const CALENDAR_ID = process.env.CALENDAR_ID || CALENDAR_ID_PADRAO;
@@ -72,6 +81,108 @@ async function devolverSaldoPacote(privateAtual) {
     throw err;
   } finally {
     dbClient.release();
+  }
+}
+
+// A partir do serviço pedido (private.servico) e do que já tinha sido coberto
+// pelo pacote no agendamento (private.pacote_usado), separa o que é
+// "coberto"/"avulso" e calcula o valor avulso — mesma regra de api/atendimentos.js,
+// só que aqui não mexe em saldo_ciclo de novo (o desconto já aconteceu no
+// agendamento, isso aqui é só pra classificar o registro financeiro).
+function calcularCoberturaEAvulso(servicoStr, pacoteUsadoStr) {
+  const chaves = normalizarServicos(servicoStr);
+  const restante = pacoteUsadoStr ? JSON.parse(pacoteUsadoStr) : {};
+  const cobertos = [];
+  const avulsos = [];
+
+  for (const chave of chaves) {
+    const campo = campoSaldo(chave); // undefined pra 'corte_kids' — sempre avulso
+    if (!campo) { avulsos.push(chave); continue; }
+    if (campo === 'sobrancelha_restante') {
+      if (restante[campo]) { cobertos.push(chave); restante[campo] = false; }
+      else avulsos.push(chave);
+    } else {
+      if (restante[campo] > 0) { cobertos.push(chave); restante[campo] -= 1; }
+      else avulsos.push(chave);
+    }
+  }
+
+  const valorCobrado = precoAvulso(avulsos);
+  const formaPagamento = avulsos.length === 0 ? 'pacote' : (cobertos.length === 0 ? 'avulso' : 'misto');
+  return { cobertos, avulsos, valorCobrado, formaPagamento };
+}
+
+// Grava (ou atualiza) o registro definitivo em `atendimentos` quando o status
+// vira 'compareceu'; remove o registro se sair de 'compareceu' pra qualquer
+// outro status. Best-effort: erro aqui não derruba a resposta de marcar-presença
+// (o status no Calendar já foi salvo, que é a ação principal) — só loga.
+async function sincronizarAtendimento(evento, status) {
+  const priv = evento.extendedProperties?.private || {};
+  const eventId = evento.id;
+
+  if (status !== 'compareceu') {
+    await pool.query(`DELETE FROM atendimentos WHERE event_id = $1`, [eventId]);
+    return;
+  }
+
+  const telefoneLimpo = priv.telefone;
+  if (!telefoneLimpo) {
+    console.error('sincronizarAtendimento: evento sem telefone, pulando registro financeiro. eventId=', eventId);
+    return;
+  }
+
+  const clienteResult = await pool.query('SELECT id FROM clientes WHERE telefone = $1', [telefoneLimpo]);
+  if (clienteResult.rows.length === 0) {
+    console.error('sincronizarAtendimento: cliente não encontrado pro telefone', telefoneLimpo, 'eventId=', eventId);
+    return;
+  }
+  const clienteId = clienteResult.rows[0].id;
+
+  const { cobertos, avulsos, valorCobrado, formaPagamento } = calcularCoberturaEAvulso(
+    priv.servico, priv.pacote_usado
+  );
+
+  const dataHora = evento.start?.dateTime || evento.start?.date || new Date().toISOString();
+  const barbeiroId = priv.barbeiro_id || null;
+
+  // Produtos vendidos junto (comanda criada no momento do agendamento com o
+  // mesmo telefone + mesmo horário de início do evento — casam exatos porque
+  // agendar.js usa a mesma string ISO pros dois).
+  let valorProdutos = 0;
+  let produtosConsumidos = null;
+  const comandaResult = await pool.query(
+    `SELECT id, produtos, valor_total FROM comandas
+     WHERE telefone = $1 AND data_hora = $2 AND atendimento_id IS NULL`,
+    [telefoneLimpo, dataHora]
+  );
+  if (comandaResult.rows.length > 0) {
+    const comanda = comandaResult.rows[0];
+    valorProdutos = Number(comanda.valor_total) || 0;
+    produtosConsumidos = comanda.produtos;
+  }
+
+  const insertResult = await pool.query(
+    `INSERT INTO atendimentos
+       (cliente_id, event_id, data_hora, servicos, forma_pagamento, valor_cobrado,
+        valor_produtos, produtos_consumidos, barbeiro_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (event_id) DO UPDATE SET
+       servicos = EXCLUDED.servicos,
+       forma_pagamento = EXCLUDED.forma_pagamento,
+       valor_cobrado = EXCLUDED.valor_cobrado,
+       valor_produtos = EXCLUDED.valor_produtos,
+       produtos_consumidos = EXCLUDED.produtos_consumidos,
+       barbeiro_id = EXCLUDED.barbeiro_id
+     RETURNING id`,
+    [
+      clienteId, eventId, dataHora, JSON.stringify([...cobertos, ...avulsos]),
+      formaPagamento, valorCobrado, valorProdutos, produtosConsumidos, barbeiroId,
+    ]
+  );
+
+  if (comandaResult.rows.length > 0) {
+    await pool.query(`UPDATE comandas SET atendimento_id = $1 WHERE id = $2`,
+      [insertResult.rows[0].id, comandaResult.rows[0].id]);
   }
 }
 
@@ -135,7 +246,8 @@ async function listarAgenda(req, res) {
       };
     });
   // Faturamento estimado do dia continua contando tudo (é só uma estimativa em tempo
-  // real) — quem quiser o número já sem falta usa o fechamento por barbeiro no Financeiro.
+  // real) — o número já sem falta e já batendo com o financeiro histórico é o
+  // /api/financeiro (que lê da tabela atendimentos, alimentada pelo marcar-presença).
   const faturamentoEstimado = eventos.reduce((s, e) => s + (e.valor || 0), 0);
   return res.status(200).json({
     success: true,
@@ -197,7 +309,17 @@ async function marcarPresenca(req, res) {
     return res.status(500).json({ error: 'Não foi possível salvar no Google Calendar: ' + err.message });
   }
 
-  return res.status(200).json({ success: true, eventId, status });
+  // Registro financeiro definitivo — best-effort, não derruba a resposta se falhar
+  // (o status já foi salvo no Calendar, que é a ação que o admin pediu).
+  let avisoFinanceiro = null;
+  try {
+    await sincronizarAtendimento({ ...evento, extendedProperties: { private: novoPrivate } }, status);
+  } catch (err) {
+    console.error('Erro ao sincronizar atendimento financeiro:', err.message);
+    avisoFinanceiro = 'Status salvo, mas houve um erro ao atualizar o financeiro: ' + err.message;
+  }
+
+  return res.status(200).json({ success: true, eventId, status, aviso_financeiro: avisoFinanceiro });
 }
 
 module.exports = async (req, res) => {
