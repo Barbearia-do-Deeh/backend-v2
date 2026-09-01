@@ -324,6 +324,64 @@ async function marcarPresenca(req, res) {
   return res.status(200).json({ success: true, eventId, status, aviso_financeiro: avisoFinanceiro });
 }
 
+// GET /api/agenda-hoje?tipo=backfill&secret=...&mes=8&ano=2026
+// USO PONTUAL: recupera pro financeiro os agendamentos já marcados "Compareceu"
+// ANTES de sincronizarAtendimento existir (o código antigo nunca gravava nada em
+// `atendimentos`). Fica dentro deste arquivo (em vez de um api/*.js novo) de
+// propósito — o plano Hobby da Vercel tem teto de 12 funções serverless por
+// deploy, e cada arquivo em api/ conta como uma. Depois de rodar uma vez e
+// conferir que o financeiro bateu, pode remover este bloco e a constante do
+// secret (não é obrigatório, é só faxina).
+const BACKFILL_SECRET = 'deeh-backfill-2026';
+
+async function backfillAtendimentos(req, res) {
+  if (req.query.secret !== BACKFILL_SECRET) {
+    return res.status(403).json({ error: 'Segredo inválido' });
+  }
+
+  const hoje = new Date();
+  const mes = parseInt(req.query.mes, 10) || (hoje.getMonth() + 1);
+  const ano = parseInt(req.query.ano, 10) || hoje.getFullYear();
+
+  const inicio = `${ano}-${String(mes).padStart(2, '0')}-01`;
+  const fimDate = new Date(Date.UTC(ano, mes, 0));
+  const fim = fimDate.toISOString().slice(0, 10);
+
+  const calendar = getCalendarClient();
+  const response = await calendar.events.list({
+    calendarId: CALENDAR_ID,
+    timeMin: `${inicio}T00:00:00-03:00`,
+    timeMax: `${fim}T23:59:59-03:00`,
+    singleEvents: true,
+    orderBy: 'startTime',
+  });
+
+  const eventos = response.data.items || [];
+  const compareceram = eventos.filter(
+    (ev) => (ev.extendedProperties?.private?.status) === 'compareceu'
+  );
+
+  let gravados = 0;
+  const erros = [];
+  for (const evento of compareceram) {
+    try {
+      await sincronizarAtendimento(evento, 'compareceu', null);
+      gravados++;
+    } catch (err) {
+      erros.push({ eventId: evento.id, erro: err.message });
+    }
+  }
+
+  return res.status(200).json({
+    success: true,
+    periodo: { mes, ano, inicio, fim },
+    total_eventos_no_periodo: eventos.length,
+    marcados_compareceu: compareceram.length,
+    gravados_com_sucesso: gravados,
+    erros,
+  });
+}
+
 async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -334,6 +392,11 @@ async function handler(req, res) {
     if (req.query.tipo === 'marcar-presenca') {
       if (req.method !== 'POST') return res.status(405).json({ error: 'Use POST' });
       return await marcarPresenca(req, res);
+    }
+
+    if (req.query.tipo === 'backfill') {
+      if (req.method !== 'GET') return res.status(405).json({ error: 'Use GET' });
+      return await backfillAtendimentos(req, res);
     }
 
     if (req.method !== 'GET') return res.status(405).json({ error: 'Método não permitido' });
