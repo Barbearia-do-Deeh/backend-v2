@@ -13,7 +13,7 @@
       "maxDuration": 10
     },
     "api/agenda-hoje.js": {
-      "maxDuration": 10
+      "maxDuration": 60
     },
     "api/push-subscribe.js": {
       "maxDuration": 10
