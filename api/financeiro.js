@@ -1,6 +1,6 @@
 const { google } = require('googleapis');
 const pool = require('../lib/db');
-const { calcularResumoFinanceiro, calcularRetencao, calcularHistoricoFinanceiro, periodoParaDatas } = require('../lib/financas');
+const { calcularResumoPeriodo, calcularRetencao, periodoParaDatas } = require('../lib/financas');
 const { CALENDAR_ID_PADRAO } = require('../lib/config-negocio');
 
 const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
@@ -16,22 +16,34 @@ function parsePreco(precoStr) {
   return Number.isFinite(num) ? num : 0;
 }
 
+// Resolve o período da consulta a partir da query string:
+//   ?inicio=YYYY-MM-DD&fim=YYYY-MM-DD  -> usa direto (semana, quinzena, personalizado, etc.)
+//   ?mes=8&ano=2026                     -> mês/ano específico (compatibilidade)
+//   nada                                -> mês atual (default de sempre)
+function resolverPeriodo(query) {
+  if (query.inicio && query.fim) {
+    return { inicio: query.inicio, fim: query.fim };
+  }
+  const hoje = new Date();
+  const mes = parseInt(query.mes, 10) || (hoje.getMonth() + 1);
+  const ano = parseInt(query.ano, 10) || hoje.getFullYear();
+  return periodoParaDatas(mes, ano);
+}
+
 // ---- Fechamento por barbeiro ----
-// GET ?tipo=barbeiros&mes=&ano=
-// Pra cada barbeiro cadastrado, calcula quanto ele tem a receber no mês:
+// GET ?tipo=barbeiros&inicio=&fim= (ou &mes=&ano= por compatibilidade)
+// Pra cada barbeiro cadastrado, calcula quanto ele tem a receber no período:
 //   regime 'aluguel'  -> valor fixo cadastrado (não depende de volume)
 //   regime 'comissao' -> % sobre a soma dos preços dos agendamentos dele no Google
-//                         Calendar naquele mês (extendedProperties.private.barbeiro_id)
+//                         Calendar naquele período (extendedProperties.private.barbeiro_id)
 // Nos dois regimes, soma também a comissão sobre produtos vendidos (tabela `comandas`,
 // filtrada por barbeiro_id).
-async function calcularFechamentoBarbeiros(client, { mes, ano }) {
-  const { inicio, fim } = periodoParaDatas(mes, ano);
-
+async function calcularFechamentoBarbeiros(client, { inicio, fim }) {
   const barbeirosResult = await client.query('SELECT * FROM barbeiros ORDER BY nome');
   const barbeiros = barbeirosResult.rows;
 
-  // Receita de serviços por barbeiro: uma única busca no Calendar cobrindo o mês inteiro,
-  // depois soma em memória por barbeiro_id (evita 1 chamada de API por barbeiro).
+  // Receita de serviços por barbeiro: uma única busca no Calendar cobrindo o período
+  // inteiro, depois soma em memória por barbeiro_id (evita 1 chamada de API por barbeiro).
   const receitaServicosPorBarbeiro = {};
   try {
     const auth = new google.auth.JWT({
@@ -66,7 +78,7 @@ async function calcularFechamentoBarbeiros(client, { mes, ano }) {
     // do que derrubar a tela inteira do Financeiro
   }
 
-  // Receita de produtos por barbeiro (comandas do mês)
+  // Receita de produtos por barbeiro (comandas do período)
   const comandasResult = await client.query(
     `SELECT barbeiro_id, COALESCE(SUM(valor_total), 0) AS total
      FROM comandas
@@ -121,19 +133,15 @@ module.exports = async (req, res) => {
       const retencao = await calcularRetencao(client);
       return res.status(200).json({ success: true, retencao });
     }
-    const hoje = new Date();
-    const mes = parseInt(req.query.mes, 10) || (hoje.getMonth() + 1);
-    const ano = parseInt(req.query.ano, 10) || hoje.getFullYear();
-    if (req.query.tipo === 'historico') {
-      const meses = parseInt(req.query.meses, 10) || 6;
-      const historico = await calcularHistoricoFinanceiro(client, { mes, ano, meses });
-      return res.status(200).json({ success: true, historico });
-    }
+
+    const { inicio, fim } = resolverPeriodo(req.query);
+
     if (req.query.tipo === 'barbeiros') {
-      const barbeiros = await calcularFechamentoBarbeiros(client, { mes, ano });
-      return res.status(200).json({ success: true, periodo: { mes, ano }, barbeiros });
+      const barbeiros = await calcularFechamentoBarbeiros(client, { inicio, fim });
+      return res.status(200).json({ success: true, periodo: { inicio, fim }, barbeiros });
     }
-    const resumo = await calcularResumoFinanceiro(client, { mes, ano });
+
+    const resumo = await calcularResumoPeriodo(client, { inicio, fim });
     return res.status(200).json({ success: true, ...resumo });
   } catch (err) {
     console.error('Erro em /api/financeiro:', err.message);
