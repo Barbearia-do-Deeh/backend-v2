@@ -28,6 +28,17 @@ function servicosParaChaves(servicoStr) {
   return (servicoStr || '').split(' + ').map(s => MAPA[s.trim()] || null);
 }
 
+// Normaliza uma data vinda do Postgres pro formato "YYYY-MM-DD" — o driver pode
+// devolver colunas DATE como objeto JS Date (não como string), e comparar
+// string com Date direto (`"2026-08-31" > dataFimCicloObjeto`) não funciona
+// como parece: o JS converte o Date pra uma string tipo "Sun Aug 31 2026...",
+// e a comparação lexicográfica fica errada quase sempre.
+function paraDataISO(valor) {
+  if (!valor) return null;
+  if (valor instanceof Date) return valor.toISOString().slice(0, 10);
+  return String(valor).slice(0, 10);
+}
+
 // Devolve pro saldo_ciclo o que tinha sido descontado num agendamento (falta
 // ou cancelamento). `privateAtual` é o extendedProperties.private do evento —
 // precisa ter `pacote_usado` (JSON gravado no momento do agendamento) e
@@ -318,11 +329,6 @@ async function criarAgendamento(req, res) {
   const duracaoMin = duracao === '15 min' ? 15 : 60;
 
   // ---- Validação de dia/horário de funcionamento — TRAVA NO SERVIDOR ----
-  // Antes essa regra só existia no front-end (index.html). Se o front tivesse
-  // qualquer brecha (bug de fuso, cache antigo, tela de horário fixo etc.), o
-  // back-end aceitava o agendamento numa boa — foi o que deixou passar
-  // agendamento em dia fechado (terça-feira). Agora o servidor recusa sempre,
-  // não importa o que o front mandar.
   const erroHorario = validarHorarioFuncionamento(ano, mes, dia, horario, duracaoMin);
   if (erroHorario) {
     return res.status(400).json({ error: erroHorario });
@@ -331,16 +337,6 @@ async function criarAgendamento(req, res) {
   const startUTC = new Date(Date.UTC(ano, mes - 1, dia, hora, minuto));
   const endUTC = new Date(startUTC.getTime() + duracaoMin * 60000);
 
-  // ---- Correção de fuso pra comparação de conflito ----
-  // startUTC/endUTC acima tratam "13:00" como se já fosse UTC (é um truque só
-  // pra montar a STRING enviada ao Google com toISO(), que troca o "Z" por
-  // "-03:00" — isso sim fica correto). Só que pra COMPARAR contra os horários
-  // reais dos eventos existentes (que o Google já devolve no fuso certo,
-  // portanto 3h à frente desse valor "cru"), precisa somar as 3h de volta.
-  // Sem isso, a checagem de conflito compara como se o cliente tivesse
-  // escolhido um horário 3h mais cedo do que realmente escolheu — foi isso
-  // que deixava agendar por cima de compromissos que começavam mais tarde
-  // no dia (o sistema achava que ainda não tinha chegado no horário deles).
   const FUSO_SP_MS = 3 * 60 * 60 * 1000;
   const startReal = startUTC.getTime() + FUSO_SP_MS;
   const endReal = endUTC.getTime() + FUSO_SP_MS;
@@ -370,11 +366,9 @@ async function criarAgendamento(req, res) {
     : '';
 
   // ---- Pacote: desconta saldo AGORA, no agendamento (Opção B) ----
-  // Só mexe em quem já tem plano ativo — cliente sem plano segue igual a
-  // sempre foi (cobrança avulsa normal, sem passar por nada disso).
   const chavesServico = servicosParaChaves(servico); // ex: ['corte','barba']; 'Corte Kids' vira null
-  const pacoteUsado = {};       // o que foi de fato descontado agora (pra devolver depois, se faltar/cancelar)
-  let avisoNovoPacote = null;   // preenchido quando algum serviço pedido já estourou o saldo do ciclo atual
+  const pacoteUsado = {};
+  let avisoNovoPacote = null;
 
   const dbClientPacote = await pool.connect();
   try {
@@ -388,12 +382,27 @@ async function criarAgendamento(req, res) {
       [telefoneLimpo]
     );
 
+    if (clienteResult.rows.length === 0) {
+      console.log('[pacote] cliente não encontrado ainda pelo telefone (normal em 1º agendamento de quem não tem plano) — telefone:', telefoneLimpo);
+    }
+
     if (clienteResult.rows.length > 0 && clienteResult.rows[0].plano && clienteResult.rows[0].plano !== 'nenhum') {
       let cliente = clienteResult.rows[0];
+      console.log('[pacote] cliente com plano encontrado:', {
+        clienteId: cliente.id, plano: cliente.plano, servico, chavesServico,
+        saldoAtual: {
+          cortes: cliente.cortes_restantes, barbas: cliente.barbas_restantes,
+          pezinhos: cliente.pezinhos_restantes, sobrancelha: cliente.sobrancelha_restante,
+        },
+      });
 
-      // Renova o ciclo se já venceu (mesma regra usada em api/atendimentos.js)
+      // Renova o ciclo se já venceu (mesma regra usada em api/atendimentos.js).
+      // paraDataISO normaliza data_fim_ciclo pra string "YYYY-MM-DD" antes de
+      // comparar — o driver do Postgres pode devolver DATE como objeto Date,
+      // e comparar string com Date direto não funciona como parece.
       const hojeStr = new Date().toISOString().slice(0, 10);
-      if (cliente.data_fim_ciclo && hojeStr > cliente.data_fim_ciclo) {
+      const fimCicloISO = paraDataISO(cliente.data_fim_ciclo);
+      if (fimCicloISO && hojeStr > fimCicloISO) {
         const novoInicio = hojeStr;
         const novoFim = addDias(hojeStr, 30);
         const saldoNovo = saldoInicial(cliente.plano, cliente.subtipo_essencial);
@@ -407,6 +416,7 @@ async function criarAgendamento(req, res) {
           [saldoNovo.cortes_restantes, saldoNovo.barbas_restantes, saldoNovo.pezinhos_restantes, saldoNovo.sobrancelha_restante, cliente.id]
         );
         cliente = { ...cliente, ...saldoNovo, data_inicio_ciclo: novoInicio, data_fim_ciclo: novoFim };
+        console.log('[pacote] ciclo renovado (tinha vencido):', { clienteId: cliente.id, novoInicio, novoFim });
       }
 
       const updates = {};
@@ -415,7 +425,7 @@ async function criarAgendamento(req, res) {
         if (!campo) continue; // ex: Corte Kids — nunca usa saldo de pacote
 
         if (campo === 'sobrancelha_restante') {
-          const disponivel = updates[campo] !== undefined ? updates[campo] : cliente.sobrancelha_restante;
+          const disponivel = updates[campo] !== undefined ? updates[campo] : !!cliente.sobrancelha_restante;
           if (disponivel) {
             updates[campo] = false;
             pacoteUsado[campo] = true;
@@ -423,7 +433,11 @@ async function criarAgendamento(req, res) {
             avisoNovoPacote = avisoNovoPacote || { plano: cliente.plano, valor: VALOR_PLANO[cliente.plano] };
           }
         } else {
-          const atual = updates[campo] !== undefined ? updates[campo] : cliente[campo];
+          // CORREÇÃO: cliente[campo] pode vir `null` se o cliente não tiver
+          // linha em saldo_ciclo ainda (LEFT JOIN sem match) — "null > 0" é
+          // sempre false em JS, então sem esse `?? 0` o código silenciosamente
+          // tratava como "sem saldo" e nunca descontava nem avisava nada.
+          const atual = updates[campo] !== undefined ? updates[campo] : (cliente[campo] ?? 0);
           if (atual > 0) {
             updates[campo] = atual - 1;
             pacoteUsado[campo] = (pacoteUsado[campo] || 0) + 1;
@@ -433,19 +447,23 @@ async function criarAgendamento(req, res) {
         }
       }
 
+      console.log('[pacote] resultado do cálculo:', { updates, pacoteUsado, avisoNovoPacote });
+
       const setClauses = Object.keys(updates).map((campo, i) => `${campo} = $${i + 2}`);
       if (setClauses.length > 0) {
         await dbClientPacote.query(
           `UPDATE saldo_ciclo SET ${setClauses.join(', ')} WHERE cliente_id = $1`,
           [cliente.id, ...Object.values(updates)]
         );
+      } else {
+        console.log('[pacote] nenhum campo pra atualizar — ou o serviço não mapeou pra nenhuma chave de pacote, ou não tinha saldo em nada.');
       }
     }
 
     await dbClientPacote.query('COMMIT');
   } catch (err) {
     await dbClientPacote.query('ROLLBACK');
-    console.error('Erro ao processar saldo de pacote:', err.message);
+    console.error('Erro ao processar saldo de pacote:', err.message, err.stack);
     // Não derruba o agendamento por causa disso — segue e cobra avulso normal.
   } finally {
     dbClientPacote.release();
@@ -463,10 +481,6 @@ async function criarAgendamento(req, res) {
   const resumoBarbeiro = nomeBarbeiro ? `\n✂️ Profissional: ${nomeBarbeiro}` : '';
 
   // ---- Checagem final de conflito, na hora H ----
-  // CORREÇÃO: eventos de "dia inteiro" (sem dateTime, só "date" — ex: compromisso
-  // pessoal criado direto no Calendar sem marcar hora) antes eram IGNORADOS aqui
-  // (`if (!ev.start?.dateTime...) return false`), então o sistema agendava por
-  // cima deles sem perceber. Agora um evento de dia inteiro bloqueia o dia todo.
   try {
     const dataISO = `${ano}-${String(mes).padStart(2, '0')}-${String(dia).padStart(2, '0')}`;
     const diaResp = await calendar.events.list({
@@ -481,7 +495,6 @@ async function criarAgendamento(req, res) {
       const barbeiroDoEvento = ev.extendedProperties?.private?.barbeiro_id;
       if (barbeiro_id && barbeiroDoEvento && barbeiroDoEvento !== String(barbeiro_id)) return false;
 
-      // Evento de dia inteiro (sem horário específico) bloqueia o dia todo.
       if (!ev.start?.dateTime || !ev.end?.dateTime) {
         return !!(ev.start?.date || ev.end?.date);
       }
@@ -592,7 +605,7 @@ async function criarAgendamento(req, res) {
     comanda_id: comandaId,
     produtos: itensProduto,
     valor_produtos: valorProdutos,
-    aviso_pacote: avisoNovoPacote, // { plano, valor } quando algum serviço já estourou o saldo do ciclo atual
+    aviso_pacote: avisoNovoPacote,
   });
 }
 
