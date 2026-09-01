@@ -324,7 +324,7 @@ async function marcarPresenca(req, res) {
   return res.status(200).json({ success: true, eventId, status, aviso_financeiro: avisoFinanceiro });
 }
 
-module.exports = async (req, res) => {
+async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -342,4 +342,11 @@ module.exports = async (req, res) => {
     console.error('Erro em /api/agenda-hoje:', err.message);
     return res.status(500).json({ success: false, error: err.message });
   }
-};
+}
+
+module.exports = handler;
+// Reaproveitados pelo backfill (api/backfill-atendimentos.js) — não muda o
+// comportamento do endpoint em si, só expõe essas funções pra outro arquivo.
+module.exports.getCalendarClient = getCalendarClient;
+module.exports.sincronizarAtendimento = sincronizarAtendimento;
+module.exports.CALENDAR_ID = CALENDAR_ID;
