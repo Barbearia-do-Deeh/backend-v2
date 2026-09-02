@@ -15,6 +15,9 @@
     "api/agenda-hoje.js": {
       "maxDuration": 60
     },
+    "api/agendar-fixo.js": {
+      "maxDuration": 60
+    },
     "api/push-subscribe.js": {
       "maxDuration": 10
     },
