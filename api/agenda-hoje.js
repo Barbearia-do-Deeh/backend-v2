@@ -19,6 +19,14 @@
 // Idempotente via coluna `event_id` (UNIQUE): alternar o status várias vezes não
 // duplica registro.
 //
+// RAZÃO FINANCEIRO (`lancamentos_financeiros`): espelha o mesmo ciclo de vida do
+// `atendimentos` (nasce/atualiza/some junto), mas separa duas coisas que o Calendar
+// misturava: `valor` (o que o cliente de fato pagou nessa visita — zero se 100%
+// coberto por pacote) e `valor_referencia` (preço de TABELA de tudo que foi
+// realizado, cobertos ou não). api/financeiro.js usa `valor_referencia` pra
+// calcular comissão do barbeiro — ele presta o serviço independente de como o
+// cliente pagou.
+//
 // Se o agendamento tinha descontado saldo de pacote (ver criarAgendamento em
 // api/agendar.js — o desconto acontece JÁ no agendamento, não espera "Compareceu"),
 // marcar "faltou" devolve esse crédito automaticamente: falta não deveria custar
@@ -86,9 +94,10 @@ async function devolverSaldoPacote(privateAtual) {
 
 // A partir do serviço pedido (private.servico) e do que já tinha sido coberto
 // pelo pacote no agendamento (private.pacote_usado), separa o que é
-// "coberto"/"avulso" e calcula o valor avulso — mesma regra de api/atendimentos.js,
-// só que aqui não mexe em saldo_ciclo de novo (o desconto já aconteceu no
-// agendamento, isso aqui é só pra classificar o registro financeiro).
+// "coberto"/"avulso" e calcula os dois valores que o razão precisa: o que foi
+// de fato cobrado do cliente (valorCobrado, considera só os avulsos) e o preço
+// de tabela de TUDO que foi realizado (valorReferencia, base de comissão do
+// barbeiro — independe de pacote).
 function calcularCoberturaEAvulso(servicoStr, pacoteUsadoStr) {
   const chaves = normalizarServicos(servicoStr);
   const restante = pacoteUsadoStr ? JSON.parse(pacoteUsadoStr) : {};
@@ -108,20 +117,26 @@ function calcularCoberturaEAvulso(servicoStr, pacoteUsadoStr) {
   }
 
   const valorCobrado = precoAvulso(avulsos);
+  const valorReferencia = precoAvulso([...cobertos, ...avulsos]);
   const formaPagamento = avulsos.length === 0 ? 'pacote' : (cobertos.length === 0 ? 'avulso' : 'misto');
-  return { cobertos, avulsos, valorCobrado, formaPagamento };
+  return { cobertos, avulsos, valorCobrado, valorReferencia, formaPagamento };
 }
 
-// Grava (ou atualiza) o registro definitivo em `atendimentos` quando o status
-// vira 'compareceu'; remove o registro se sair de 'compareceu' pra qualquer
-// outro status. Best-effort: erro aqui não derruba a resposta de marcar-presença
-// (o status no Calendar já foi salvo, que é a ação principal) — só loga.
+// Grava (ou atualiza) o registro definitivo em `atendimentos` E os lançamentos
+// espelhados em `lancamentos_financeiros` quando o status vira 'compareceu';
+// remove os dois se sair de 'compareceu' pra qualquer outro status. Best-effort:
+// erro aqui não derruba a resposta de marcar-presença (o status no Calendar já
+// foi salvo, que é a ação principal) — só loga.
 async function sincronizarAtendimento(evento, status, metodoPagamento) {
   const priv = evento.extendedProperties?.private || {};
   const eventId = evento.id;
 
   if (status !== 'compareceu') {
     await pool.query(`DELETE FROM atendimentos WHERE event_id = $1`, [eventId]);
+    await pool.query(
+      `DELETE FROM lancamentos_financeiros WHERE origem_tipo = 'atendimento' AND origem_id = $1`,
+      [eventId]
+    );
     return;
   }
 
@@ -138,12 +153,14 @@ async function sincronizarAtendimento(evento, status, metodoPagamento) {
   }
   const clienteId = clienteResult.rows[0].id;
 
-  const { cobertos, avulsos, valorCobrado, formaPagamento } = calcularCoberturaEAvulso(
+  const { cobertos, avulsos, valorCobrado, valorReferencia, formaPagamento } = calcularCoberturaEAvulso(
     priv.servico, priv.pacote_usado
   );
 
   const dataHora = evento.start?.dateTime || evento.start?.date || new Date().toISOString();
+  const dataCompetencia = dataHora.slice(0, 10);
   const barbeiroId = priv.barbeiro_id || null;
+  const metodoAtual = metodoPagamento || null;
 
   // Produtos vendidos junto (comanda criada no momento do agendamento com o
   // mesmo telefone + mesmo horário de início do evento — casam exatos porque
@@ -164,12 +181,13 @@ async function sincronizarAtendimento(evento, status, metodoPagamento) {
   const insertResult = await pool.query(
     `INSERT INTO atendimentos
        (cliente_id, event_id, data_hora, servicos, forma_pagamento, valor_cobrado,
-        valor_produtos, produtos_consumidos, barbeiro_id, metodo_pagamento)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        valor_referencia, valor_produtos, produtos_consumidos, barbeiro_id, metodo_pagamento)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      ON CONFLICT (event_id) DO UPDATE SET
        servicos = EXCLUDED.servicos,
        forma_pagamento = EXCLUDED.forma_pagamento,
        valor_cobrado = EXCLUDED.valor_cobrado,
+       valor_referencia = EXCLUDED.valor_referencia,
        valor_produtos = EXCLUDED.valor_produtos,
        produtos_consumidos = EXCLUDED.produtos_consumidos,
        barbeiro_id = EXCLUDED.barbeiro_id,
@@ -177,14 +195,56 @@ async function sincronizarAtendimento(evento, status, metodoPagamento) {
      RETURNING id`,
     [
       clienteId, eventId, dataHora, JSON.stringify([...cobertos, ...avulsos]),
-      formaPagamento, valorCobrado, valorProdutos, produtosConsumidos, barbeiroId,
-      metodoPagamento || null,
+      formaPagamento, valorCobrado, valorReferencia, valorProdutos, produtosConsumidos, barbeiroId,
+      metodoAtual,
     ]
   );
 
   if (comandaResult.rows.length > 0) {
     await pool.query(`UPDATE comandas SET atendimento_id = $1 WHERE id = $2`,
       [insertResult.rows[0].id, comandaResult.rows[0].id]);
+  }
+
+  // ---- Razão financeiro (lancamentos_financeiros) ----
+  await pool.query(
+    `INSERT INTO lancamentos_financeiros
+       (tipo, status, valor, valor_referencia, metodo_pagamento, data_competencia,
+        data_caixa, cliente_id, barbeiro_id, origem_tipo, origem_id)
+     VALUES ('receita_servico', 'confirmado', $1, $2, $3, $4, $4, $5, $6, 'atendimento', $7)
+     ON CONFLICT (origem_tipo, origem_id, tipo) DO UPDATE SET
+       valor = EXCLUDED.valor,
+       valor_referencia = EXCLUDED.valor_referencia,
+       metodo_pagamento = COALESCE(EXCLUDED.metodo_pagamento, lancamentos_financeiros.metodo_pagamento),
+       data_competencia = EXCLUDED.data_competencia,
+       data_caixa = EXCLUDED.data_caixa,
+       cliente_id = EXCLUDED.cliente_id,
+       barbeiro_id = EXCLUDED.barbeiro_id`,
+    [valorCobrado, valorReferencia, metodoAtual, dataCompetencia, clienteId, barbeiroId, eventId]
+  );
+
+  if (valorProdutos > 0) {
+    await pool.query(
+      `INSERT INTO lancamentos_financeiros
+         (tipo, status, valor, valor_referencia, metodo_pagamento, data_competencia,
+          data_caixa, cliente_id, barbeiro_id, origem_tipo, origem_id)
+       VALUES ('receita_produto', 'confirmado', $1, $1, $2, $3, $3, $4, $5, 'atendimento', $6)
+       ON CONFLICT (origem_tipo, origem_id, tipo) DO UPDATE SET
+         valor = EXCLUDED.valor,
+         valor_referencia = EXCLUDED.valor_referencia,
+         metodo_pagamento = COALESCE(EXCLUDED.metodo_pagamento, lancamentos_financeiros.metodo_pagamento),
+         data_competencia = EXCLUDED.data_competencia,
+         data_caixa = EXCLUDED.data_caixa,
+         cliente_id = EXCLUDED.cliente_id,
+         barbeiro_id = EXCLUDED.barbeiro_id`,
+      [valorProdutos, metodoAtual, dataCompetencia, clienteId, barbeiroId, eventId]
+    );
+  } else {
+    // Se antes tinha produto e agora não tem mais (comanda removida/zerada),
+    // limpa o lançamento órfão em vez de deixar duplicado.
+    await pool.query(
+      `DELETE FROM lancamentos_financeiros WHERE origem_tipo = 'atendimento' AND origem_id = $1 AND tipo = 'receita_produto'`,
+      [eventId]
+    );
   }
 }
 
@@ -247,9 +307,6 @@ async function listarAgenda(req, res) {
         status: priv.status || 'pendente',
       };
     });
-  // Faturamento estimado do dia continua contando tudo (é só uma estimativa em tempo
-  // real) — o número já sem falta e já batendo com o financeiro histórico é o
-  // /api/financeiro (que lê da tabela atendimentos, alimentada pelo marcar-presença).
   const faturamentoEstimado = eventos.reduce((s, e) => s + (e.valor || 0), 0);
   return res.status(200).json({
     success: true,
@@ -268,9 +325,6 @@ async function marcarPresenca(req, res) {
 
   const calendar = getCalendarClient();
 
-  // Busca o evento primeiro pra não perder telefone/servico/preco/barbeiro_id já
-  // gravados — o patch do Calendar substitui o objeto extendedProperties.private
-  // inteiro, então precisa mandar de volta tudo que já tinha + o status novo.
   let evento;
   try {
     const evResp = await calendar.events.get({ calendarId: CALENDAR_ID, eventId });
@@ -282,10 +336,6 @@ async function marcarPresenca(req, res) {
   const privateAtual = evento.extendedProperties?.private || {};
   const novoPrivate = { ...privateAtual, status };
 
-  // Falta não deveria custar o crédito do pacote — devolve o saldo que tinha
-  // sido reservado no momento do agendamento (ver criarAgendamento em
-  // api/agendar.js). pacote_estornado evita devolver duas vezes se o status
-  // for alternado (ex: Faltou -> Compareceu -> Faltou de novo).
   if (status === 'faltou') {
     try {
       await devolverSaldoPacote(privateAtual);
@@ -311,8 +361,6 @@ async function marcarPresenca(req, res) {
     return res.status(500).json({ error: 'Não foi possível salvar no Google Calendar: ' + err.message });
   }
 
-  // Registro financeiro definitivo — best-effort, não derruba a resposta se falhar
-  // (o status já foi salvo no Calendar, que é a ação que o admin pediu).
   let avisoFinanceiro = null;
   try {
     await sincronizarAtendimento({ ...evento, extendedProperties: { private: novoPrivate } }, status, metodo_pagamento);
@@ -325,13 +373,6 @@ async function marcarPresenca(req, res) {
 }
 
 // GET /api/agenda-hoje?tipo=backfill&secret=...&mes=8&ano=2026
-// USO PONTUAL: recupera pro financeiro os agendamentos já marcados "Compareceu"
-// ANTES de sincronizarAtendimento existir (o código antigo nunca gravava nada em
-// `atendimentos`). Fica dentro deste arquivo (em vez de um api/*.js novo) de
-// propósito — o plano Hobby da Vercel tem teto de 12 funções serverless por
-// deploy, e cada arquivo em api/ conta como uma. Depois de rodar uma vez e
-// conferir que o financeiro bateu, pode remover este bloco e a constante do
-// secret (não é obrigatório, é só faxina).
 const BACKFILL_SECRET = 'deeh-backfill-2026';
 
 async function backfillAtendimentos(req, res) {
@@ -408,8 +449,6 @@ async function handler(req, res) {
 }
 
 module.exports = handler;
-// Reaproveitados pelo backfill (api/backfill-atendimentos.js) — não muda o
-// comportamento do endpoint em si, só expõe essas funções pra outro arquivo.
 module.exports.getCalendarClient = getCalendarClient;
 module.exports.sincronizarAtendimento = sincronizarAtendimento;
 module.exports.CALENDAR_ID = CALENDAR_ID;
