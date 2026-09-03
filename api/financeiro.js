@@ -1,20 +1,5 @@
-const { google } = require('googleapis');
 const pool = require('../lib/db');
 const { calcularResumoPeriodo, calcularRetencao, periodoParaDatas } = require('../lib/financas');
-const { CALENDAR_ID_PADRAO } = require('../lib/config-negocio');
-
-const PRIVATE_KEY = process.env.GOOGLE_PRIVATE_KEY?.replace(/\\n/g, '\n');
-const CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL;
-const CALENDAR_ID = process.env.CALENDAR_ID || CALENDAR_ID_PADRAO;
-
-// Extrai um número de um texto de preço tipo "R$95" ou "R$95,50" (formato salvo em
-// extendedProperties.private.preco pelo agendar.js). Falha segura: retorna 0 se não achar nada.
-function parsePreco(precoStr) {
-  if (!precoStr) return 0;
-  const limpo = String(precoStr).replace(/[^\d,.-]/g, '').replace(',', '.');
-  const num = parseFloat(limpo);
-  return Number.isFinite(num) ? num : 0;
-}
 
 // Resolve o período da consulta a partir da query string:
 //   ?inicio=YYYY-MM-DD&fim=YYYY-MM-DD  -> usa direto (semana, quinzena, personalizado, etc.)
@@ -32,53 +17,31 @@ function resolverPeriodo(query) {
 
 // ---- Fechamento por barbeiro ----
 // GET ?tipo=barbeiros&inicio=&fim= (ou &mes=&ano= por compatibilidade)
-// Pra cada barbeiro cadastrado, calcula quanto ele tem a receber no período:
-//   regime 'aluguel'  -> valor fixo cadastrado (não depende de volume)
-//   regime 'comissao' -> % sobre a soma dos preços dos agendamentos dele no Google
-//                         Calendar naquele período (extendedProperties.private.barbeiro_id)
-// Nos dois regimes, soma também a comissão sobre produtos vendidos (tabela `comandas`,
-// filtrada por barbeiro_id).
+// Antes lia o preço direto de eventos do Google Calendar (extendedProperties.private.preco,
+// texto tipo "R$95,50" parseado por regex) — o que fazia a comissão de cliente de
+// pacote dar errado: o evento sempre guarda o preço de TABELA do serviço, mesmo
+// quando o cliente não pagou nada ali (já pagou na mensalidade). Agora lê de
+// `lancamentos_financeiros.valor_referencia`, gravado por api/agenda-hoje.js só
+// quando o atendimento é marcado "Compareceu" — falta já sai automaticamente
+// (nunca chega a virar lançamento), sem precisar filtrar status aqui.
 async function calcularFechamentoBarbeiros(client, { inicio, fim }) {
   const barbeirosResult = await client.query('SELECT * FROM barbeiros ORDER BY nome');
   const barbeiros = barbeirosResult.rows;
 
-  // Receita de serviços por barbeiro: uma única busca no Calendar cobrindo o período
-  // inteiro, depois soma em memória por barbeiro_id (evita 1 chamada de API por barbeiro).
+  const receitaServicosResult = await client.query(
+    `SELECT barbeiro_id, COALESCE(SUM(valor_referencia), 0) AS total
+     FROM lancamentos_financeiros
+     WHERE tipo = 'receita_servico' AND status = 'confirmado' AND barbeiro_id IS NOT NULL
+       AND data_competencia BETWEEN $1 AND $2
+     GROUP BY barbeiro_id`,
+    [inicio, fim]
+  );
   const receitaServicosPorBarbeiro = {};
-  try {
-    const auth = new google.auth.JWT({
-      email: CLIENT_EMAIL,
-      key: PRIVATE_KEY,
-      scopes: ['https://www.googleapis.com/auth/calendar.readonly'],
-    });
-    const calendar = google.calendar({ version: 'v3', auth });
-    const timeMin = `${inicio}T00:00:00-03:00`;
-    const timeMax = `${fim}T23:59:59-03:00`;
-
-    const response = await calendar.events.list({
-      calendarId: CALENDAR_ID,
-      timeMin,
-      timeMax,
-      singleEvents: true,
-      orderBy: 'startTime',
-    });
-
-    const eventos = response.data.items || [];
-    for (const ev of eventos) {
-      const priv = ev.extendedProperties?.private || {};
-      const barbeiroId = priv.barbeiro_id;
-      if (!barbeiroId) continue; // sem barbeiro marcado (bloqueio geral, ou evento antigo)
-      if (priv.status === 'faltou') continue; // cliente não veio — não conta como receita/comissão
-      const valor = parsePreco(priv.preco);
-      receitaServicosPorBarbeiro[barbeiroId] = (receitaServicosPorBarbeiro[barbeiroId] || 0) + valor;
-    }
-  } catch (err) {
-    console.error('Erro ao buscar eventos do Calendar pro fechamento por barbeiro:', err.message);
-    // segue com receitaServicosPorBarbeiro vazio — melhor mostrar comissão zerada
-    // do que derrubar a tela inteira do Financeiro
+  for (const row of receitaServicosResult.rows) {
+    receitaServicosPorBarbeiro[row.barbeiro_id] = Number(row.total);
   }
 
-  // Receita de produtos por barbeiro (comandas do período)
+  // Receita de produtos por barbeiro (comandas do período) — já era exato, mantido igual.
   const comandasResult = await client.query(
     `SELECT barbeiro_id, COALESCE(SUM(valor_total), 0) AS total
      FROM comandas
@@ -93,7 +56,7 @@ async function calcularFechamentoBarbeiros(client, { inicio, fim }) {
   }
 
   return barbeiros.map((b) => {
-    const receitaServicos = receitaServicosPorBarbeiro[String(b.id)] || 0;
+    const receitaServicos = receitaServicosPorBarbeiro[b.id] || 0;
     const receitaProdutos = receitaProdutosPorBarbeiro[b.id] || 0;
 
     const comissaoServico = b.regime === 'comissao'
