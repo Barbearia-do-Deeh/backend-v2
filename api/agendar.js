@@ -54,7 +54,12 @@ async function devolverSaldoPacote(privateAtual) {
   const dbClient = await pool.connect();
   try {
     await dbClient.query('BEGIN');
-    const result = await dbClient.query(`SELECT id FROM clientes WHERE telefone = $1 FOR UPDATE`, [telefoneLimpo]);
+    const result = await dbClient.query(
+      `SELECT id FROM clientes
+       WHERE RIGHT(regexp_replace(telefone, '\\D', '', 'g'), 11) = RIGHT($1, 11)
+       FOR UPDATE`,
+      [telefoneLimpo]
+    );
     if (result.rows.length === 0) { await dbClient.query('ROLLBACK'); return; }
     const clienteId = result.rows[0].id;
 
@@ -374,11 +379,20 @@ async function criarAgendamento(req, res) {
   try {
     await dbClientPacote.query('BEGIN');
 
+    // Comparação TOLERANTE de telefone: em vez de exigir igualdade exata (que
+    // falhava silenciosamente sempre que o telefone salvo no cadastro (pelo
+    // admin, ou por um agendamento anterior) tinha um formato levemente
+    // diferente do que o cliente digitou agora no app — DDI 55 a mais/a
+    // menos, zero na frente, espaços, etc. — casa pelos últimos 11 dígitos.
+    // Isso era o que fazia cliente de pacote (sem horário fixo, agendando
+    // sozinho pelo app) cair silenciosamente como "sem pacote" e cobrar
+    // preço cheio, inflando a Receita total do Financeiro.
     const clienteResult = await dbClientPacote.query(
       `SELECT c.id, c.plano, c.subtipo_essencial, c.data_fim_ciclo,
               s.cortes_restantes, s.barbas_restantes, s.pezinhos_restantes, s.sobrancelha_restante
        FROM clientes c LEFT JOIN saldo_ciclo s ON s.cliente_id = c.id
-       WHERE c.telefone = $1 FOR UPDATE`,
+       WHERE RIGHT(regexp_replace(c.telefone, '\\D', '', 'g'), 11) = RIGHT($1, 11)
+       FOR UPDATE`,
       [telefoneLimpo]
     );
 
