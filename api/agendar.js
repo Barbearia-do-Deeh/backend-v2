@@ -350,10 +350,11 @@ async function criarAgendamento(req, res) {
 
   let itensProduto = [];
   let valorProdutos = 0;
+  let custoProdutos = 0;
   if (Array.isArray(produtos) && produtos.length > 0) {
     const ids = produtos.map(p => p.id);
     const result = await pool.query(
-      `SELECT id, nome, preco FROM produtos WHERE id = ANY($1::int[]) AND ativo = true`,
+      `SELECT id, nome, preco, preco_custo FROM produtos WHERE id = ANY($1::int[]) AND ativo = true`,
       [ids]
     );
     const catalogo = new Map(result.rows.map(p => [p.id, p]));
@@ -362,7 +363,11 @@ async function criarAgendamento(req, res) {
       if (!info) continue;
       const quantidade = p.quantidade && p.quantidade > 0 ? p.quantidade : 1;
       valorProdutos += Number(info.preco) * quantidade;
-      itensProduto.push({ id: info.id, nome: info.nome, preco: Number(info.preco), quantidade });
+      custoProdutos += Number(info.preco_custo || 0) * quantidade;
+      itensProduto.push({
+        id: info.id, nome: info.nome, preco: Number(info.preco),
+        custo: Number(info.preco_custo || 0), quantidade,
+      });
     }
   }
 
@@ -602,9 +607,9 @@ async function criarAgendamento(req, res) {
   if (itensProduto.length > 0) {
     try {
       const comandaResult = await pool.query(
-        `INSERT INTO comandas (telefone, data_hora, produtos, valor_total, barbeiro_id)
-         VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-        [telefoneLimpo, toISO(startUTC), JSON.stringify(itensProduto), valorProdutos, barbeiro_id || null]
+        `INSERT INTO comandas (telefone, data_hora, produtos, valor_total, custo_total, barbeiro_id)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [telefoneLimpo, toISO(startUTC), JSON.stringify(itensProduto), valorProdutos, custoProdutos, barbeiro_id || null]
       );
       comandaId = comandaResult.rows[0].id;
     } catch (err) {
