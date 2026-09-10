@@ -9,7 +9,7 @@ function addDias(data, dias) {
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   if (req.method === 'OPTIONS') return res.status(200).end();
@@ -17,8 +17,60 @@ module.exports = async (req, res) => {
   const { tipo } = req.query;
   const client = await pool.connect();
   try {
-    // ---- Produtos: listagem e comanda ----
+    // ---- Produtos ----
     if (tipo === 'produtos') {
+
+      // ---- Catálogo (admin): CRUD completo, incluindo preço de custo ----
+      // Preço de custo NUNCA aparece na listagem pública (?tipo=produtos sem
+      // recurso, usada pelo app do cliente) — só aqui, em ?recurso=catalogo,
+      // que só o admin.html chama.
+      if (req.query.recurso === 'catalogo') {
+        if (req.method === 'GET') {
+          const result = await client.query(
+            `SELECT id, nome, descricao, preco, preco_custo, imagem_url, ativo
+             FROM produtos ORDER BY nome`
+          );
+          return res.status(200).json({ success: true, produtos: result.rows });
+        }
+
+        if (req.method === 'POST') {
+          const { nome, descricao, preco, preco_custo, imagem_url } = req.body;
+          if (!nome || preco === undefined || preco === null || preco === '') {
+            return res.status(400).json({ error: 'nome e preco são obrigatórios' });
+          }
+          const result = await client.query(
+            `INSERT INTO produtos (nome, descricao, preco, preco_custo, imagem_url, ativo)
+             VALUES ($1, $2, $3, $4, $5, true) RETURNING id`,
+            [nome, descricao || null, preco, preco_custo || 0, imagem_url || null]
+          );
+          return res.status(200).json({ success: true, id: result.rows[0].id });
+        }
+
+        if (req.method === 'PUT') {
+          const { id, nome, descricao, preco, preco_custo, imagem_url, ativo } = req.body;
+          if (!id) return res.status(400).json({ error: 'id é obrigatório' });
+          await client.query(
+            `UPDATE produtos SET nome = $2, descricao = $3, preco = $4, preco_custo = $5,
+             imagem_url = $6, ativo = $7 WHERE id = $1`,
+            [id, nome, descricao || null, preco, preco_custo || 0, imagem_url || null, ativo !== false]
+          );
+          return res.status(200).json({ success: true });
+        }
+
+        if (req.method === 'DELETE') {
+          // Desativa em vez de apagar — preserva o histórico de comandas antigas,
+          // que já guardam nome/preço/custo congelados no momento da venda dentro
+          // do próprio JSON da comanda (não dependem de o produto ainda existir).
+          const { id } = req.body;
+          if (!id) return res.status(400).json({ error: 'id é obrigatório' });
+          await client.query(`UPDATE produtos SET ativo = false WHERE id = $1`, [id]);
+          return res.status(200).json({ success: true });
+        }
+
+        return res.status(405).json({ error: 'Método não permitido' });
+      }
+
+      // ---- Listagem pública (app do cliente) e registro de comanda ----
       if (req.method === 'GET') {
         const result = await client.query(
           `SELECT id, nome, descricao, preco, imagem_url FROM produtos WHERE ativo = true ORDER BY nome`
@@ -34,19 +86,24 @@ module.exports = async (req, res) => {
 
         const ids = produtos.map(p => p.id);
         const result = await client.query(
-          `SELECT id, nome, preco FROM produtos WHERE id = ANY($1::int[]) AND ativo = true`,
+          `SELECT id, nome, preco, preco_custo FROM produtos WHERE id = ANY($1::int[]) AND ativo = true`,
           [ids]
         );
         const catalogo = new Map(result.rows.map(p => [p.id, p]));
 
         let valorTotal = 0;
+        let custoTotal = 0;
         const itens = [];
         for (const p of produtos) {
           const info = catalogo.get(p.id);
           if (!info) continue;
           const quantidade = p.quantidade && p.quantidade > 0 ? p.quantidade : 1;
           valorTotal += Number(info.preco) * quantidade;
-          itens.push({ id: info.id, nome: info.nome, preco: Number(info.preco), quantidade });
+          custoTotal += Number(info.preco_custo || 0) * quantidade;
+          itens.push({
+            id: info.id, nome: info.nome, preco: Number(info.preco),
+            custo: Number(info.preco_custo || 0), quantidade,
+          });
         }
 
         if (itens.length === 0) {
@@ -54,9 +111,9 @@ module.exports = async (req, res) => {
         }
 
         const comandaResult = await client.query(
-          `INSERT INTO comandas (telefone, data_hora, produtos, valor_total, barbeiro_id)
-           VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-          [telefone, data_hora, JSON.stringify(itens), valorTotal, barbeiro_id || null]
+          `INSERT INTO comandas (telefone, data_hora, produtos, valor_total, custo_total, barbeiro_id)
+           VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+          [telefone, data_hora, JSON.stringify(itens), valorTotal, custoTotal, barbeiro_id || null]
         );
 
         return res.status(200).json({
@@ -70,7 +127,7 @@ module.exports = async (req, res) => {
       return res.status(405).json({ error: 'Método não permitido' });
     }
 
-    // ---- Atendimentos: comportamento original ----
+    // ---- Atendimentos: comportamento original (sem alteração) ----
     if (req.method === 'GET') {
       const { telefone } = req.query;
 
