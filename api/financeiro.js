@@ -17,13 +17,13 @@ function resolverPeriodo(query) {
 
 // ---- Fechamento por barbeiro ----
 // GET ?tipo=barbeiros&inicio=&fim= (ou &mes=&ano= por compatibilidade)
-// Antes lia o preço direto de eventos do Google Calendar (extendedProperties.private.preco,
-// texto tipo "R$95,50" parseado por regex) — o que fazia a comissão de cliente de
-// pacote dar errado: o evento sempre guarda o preço de TABELA do serviço, mesmo
-// quando o cliente não pagou nada ali (já pagou na mensalidade). Agora lê de
-// `lancamentos_financeiros.valor_referencia`, gravado por api/agenda-hoje.js só
-// quando o atendimento é marcado "Compareceu" — falta já sai automaticamente
-// (nunca chega a virar lançamento), sem precisar filtrar status aqui.
+// Lê o preço de serviço de `lancamentos_financeiros.valor_referencia` (gravado
+// por api/agenda-hoje.js só quando o atendimento é marcado "Compareceu" —
+// falta já sai automaticamente, sem precisar filtrar status aqui). Comissão
+// sobre PRODUTO incide sobre a MARGEM (venda − custo), não sobre a venda
+// bruta — decisão confirmada por David. custo_total é gravado por comanda no
+// momento da venda (agendar.js / atendimentos.js), refletindo o preço de
+// custo vigente naquela venda mesmo que o custo cadastrado mude depois.
 async function calcularFechamentoBarbeiros(client, { inicio, fim }) {
   const barbeirosResult = await client.query('SELECT * FROM barbeiros ORDER BY nome');
   const barbeiros = barbeirosResult.rows;
@@ -41,9 +41,10 @@ async function calcularFechamentoBarbeiros(client, { inicio, fim }) {
     receitaServicosPorBarbeiro[row.barbeiro_id] = Number(row.total);
   }
 
-  // Receita de produtos por barbeiro (comandas do período) — já era exato, mantido igual.
   const comandasResult = await client.query(
-    `SELECT barbeiro_id, COALESCE(SUM(valor_total), 0) AS total
+    `SELECT barbeiro_id,
+            COALESCE(SUM(valor_total), 0) AS receita,
+            COALESCE(SUM(custo_total), 0) AS custo
      FROM comandas
      WHERE barbeiro_id IS NOT NULL
        AND data_hora::date BETWEEN $1 AND $2
@@ -51,18 +52,21 @@ async function calcularFechamentoBarbeiros(client, { inicio, fim }) {
     [inicio, fim]
   );
   const receitaProdutosPorBarbeiro = {};
+  const margemProdutosPorBarbeiro = {};
   for (const row of comandasResult.rows) {
-    receitaProdutosPorBarbeiro[row.barbeiro_id] = Number(row.total);
+    receitaProdutosPorBarbeiro[row.barbeiro_id] = Number(row.receita);
+    margemProdutosPorBarbeiro[row.barbeiro_id] = Number(row.receita) - Number(row.custo);
   }
 
   return barbeiros.map((b) => {
     const receitaServicos = receitaServicosPorBarbeiro[b.id] || 0;
     const receitaProdutos = receitaProdutosPorBarbeiro[b.id] || 0;
+    const margemProdutos = margemProdutosPorBarbeiro[b.id] || 0;
 
     const comissaoServico = b.regime === 'comissao'
       ? receitaServicos * ((Number(b.comissao_servico_pct) || 0) / 100)
       : 0;
-    const comissaoProdutos = receitaProdutos * ((Number(b.comissao_produtos_pct) || 0) / 100);
+    const comissaoProdutos = margemProdutos * ((Number(b.comissao_produtos_pct) || 0) / 100);
     const aluguel = b.regime === 'aluguel' ? (Number(b.aluguel_fixo_valor) || 0) : 0;
 
     const totalAPagar = b.regime === 'aluguel'
@@ -76,6 +80,7 @@ async function calcularFechamentoBarbeiros(client, { inicio, fim }) {
       ativo: b.ativo,
       receita_servicos: Number(receitaServicos.toFixed(2)),
       receita_produtos: Number(receitaProdutos.toFixed(2)),
+      margem_produtos: Number(margemProdutos.toFixed(2)),
       aluguel_fixo: Number(aluguel.toFixed(2)),
       comissao_servico: Number(comissaoServico.toFixed(2)),
       comissao_produtos: Number(comissaoProdutos.toFixed(2)),
