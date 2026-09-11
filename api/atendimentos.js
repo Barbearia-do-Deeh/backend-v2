@@ -70,6 +70,95 @@ module.exports = async (req, res) => {
         return res.status(405).json({ error: 'Método não permitido' });
       }
 
+      // ---- Venda avulsa de produto (balcão, sem agendamento associado) ----
+      // Usada pelo admin (ficha do cliente) quando o cliente compra produto
+      // sem estar vinculado a um horário marcado. Vira um "atendimento" sem
+      // serviço (servicos=[], valor_cobrado=0), só pra ter UM lugar só de
+      // onde o Resumo do Financeiro lê receita de produto (evita reabrir o
+      // mesmo problema de duas fontes de verdade que motivou o redesenho do
+      // Financeiro) — e gera o lançamento correspondente em
+      // lancamentos_financeiros, igual a qualquer venda vinculada a agendamento.
+      if (req.query.recurso === 'venda-avulsa') {
+        if (req.method !== 'POST') return res.status(405).json({ error: 'Método não permitido' });
+
+        const { cliente_id, produtos, barbeiro_id, metodo_pagamento } = req.body;
+        if (!cliente_id || !Array.isArray(produtos) || produtos.length === 0) {
+          return res.status(400).json({ error: 'cliente_id e produtos (array) são obrigatórios' });
+        }
+
+        const clienteResult = await client.query(`SELECT id, telefone FROM clientes WHERE id = $1`, [cliente_id]);
+        if (clienteResult.rows.length === 0) {
+          return res.status(404).json({ error: 'Cliente não encontrado' });
+        }
+        const telefoneCliente = clienteResult.rows[0].telefone;
+
+        const ids = produtos.map(p => p.id);
+        const catalogoResult = await client.query(
+          `SELECT id, nome, preco, preco_custo FROM produtos WHERE id = ANY($1::int[]) AND ativo = true`,
+          [ids]
+        );
+        const catalogo = new Map(catalogoResult.rows.map(p => [p.id, p]));
+
+        let valorTotal = 0;
+        let custoTotal = 0;
+        const itens = [];
+        for (const p of produtos) {
+          const info = catalogo.get(p.id);
+          if (!info) continue;
+          const quantidade = p.quantidade && p.quantidade > 0 ? p.quantidade : 1;
+          valorTotal += Number(info.preco) * quantidade;
+          custoTotal += Number(info.preco_custo || 0) * quantidade;
+          itens.push({
+            id: info.id, nome: info.nome, preco: Number(info.preco),
+            custo: Number(info.preco_custo || 0), quantidade,
+          });
+        }
+        if (itens.length === 0) {
+          return res.status(400).json({ error: 'Nenhum produto válido encontrado' });
+        }
+
+        const agoraISO = new Date().toISOString();
+        const dataCompetencia = agoraISO.slice(0, 10);
+        // Sintético (não vem de evento do Calendar) — só precisa ser único pra
+        // satisfazer o UNIQUE de atendimentos.event_id e de lancamentos_financeiros.
+        const eventIdSintetico = `avulso-${cliente_id}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
+        await client.query('BEGIN');
+        try {
+          const comandaResult = await client.query(
+            `INSERT INTO comandas (telefone, data_hora, produtos, valor_total, custo_total, barbeiro_id)
+             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+            [telefoneCliente, agoraISO, JSON.stringify(itens), valorTotal, custoTotal, barbeiro_id || null]
+          );
+
+          const atendimentoResult = await client.query(
+            `INSERT INTO atendimentos
+               (cliente_id, event_id, data_hora, servicos, forma_pagamento, valor_cobrado,
+                valor_referencia, valor_produtos, produtos_consumidos, barbeiro_id, metodo_pagamento)
+             VALUES ($1, $2, $3, '[]', 'avulso', 0, 0, $4, $5, $6, $7) RETURNING id`,
+            [cliente_id, eventIdSintetico, agoraISO, valorTotal, JSON.stringify(itens), barbeiro_id || null, metodo_pagamento || null]
+          );
+
+          await client.query(`UPDATE comandas SET atendimento_id = $1 WHERE id = $2`,
+            [atendimentoResult.rows[0].id, comandaResult.rows[0].id]);
+
+          await client.query(
+            `INSERT INTO lancamentos_financeiros
+               (tipo, status, valor, valor_referencia, metodo_pagamento, data_competencia,
+                data_caixa, cliente_id, barbeiro_id, origem_tipo, origem_id)
+             VALUES ('receita_produto', 'confirmado', $1, $1, $2, $3, $3, $4, $5, 'atendimento', $6)
+             ON CONFLICT (origem_tipo, origem_id, tipo) DO NOTHING`,
+            [valorTotal, metodo_pagamento || null, dataCompetencia, cliente_id, barbeiro_id || null, eventIdSintetico]
+          );
+
+          await client.query('COMMIT');
+          return res.status(200).json({ success: true, comanda_id: comandaResult.rows[0].id, valor_total: valorTotal });
+        } catch (err) {
+          await client.query('ROLLBACK');
+          throw err;
+        }
+      }
+
       // ---- Listagem pública (app do cliente) e registro de comanda ----
       if (req.method === 'GET') {
         const result = await client.query(
